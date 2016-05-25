@@ -1,8 +1,8 @@
-netnode: netnode.c netnode.h print_message.o
-	gcc -g -Wall -DMAIN -o netnode netnode.c print_message.o
+netnode: netnode.c netnode.h hexdump.o
+	gcc -g -Wall -DMAIN -o netnode netnode.c hexdump.o
 
-print_message.o: print_message.c print_message.h
-	gcc -g -Wall -c print_message.c
+hexdump.o: hexdump.c hexdump.h
+	gcc -g -Wall -c hexdump.c
 
 netnode.o: netnode.c netnode.h
 	gcc -g -Wall -c netnode.c

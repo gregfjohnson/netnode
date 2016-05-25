@@ -62,7 +62,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <ctype.h>
-#include "print_message.h"
+#include "hexdump.h"
 
 #ifdef WINDOWS
     #include "windows.h"
@@ -94,7 +94,6 @@
 #include <string.h>
 
 #include "netnode.h"
-// #include "util/print_message.h"
 
 #ifdef PCAP_LIB
     #define HAVE_REMOTE
@@ -1222,7 +1221,7 @@ static void print_text_msg(byte *buffer, int length) {
 
 static void print_hex_msg(byte *buffer, int length) {
     fprintf(stderr, "out message:\n");
-    print_message((char *) buffer, length);
+    hexdump(buffer, length);
 }
 
 /*****************************************************************************
@@ -1255,7 +1254,7 @@ static void do_output(int fd_ind, byte *buffer, int length, char got_udp_msg,
                     ntohs(fds[fd_ind]->msg_sockaddr.sin_port));
         }
         fprintf(stderr, "\n");
-        print_message((char *) buffer, length);
+        hexdump(buffer, length);
     }
 
     /* if read failed and we are doing tcp, close the connection */
