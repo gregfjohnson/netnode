@@ -37,5 +37,7 @@ int main(int argc, char **argv) {
         printf("test %d:\n", i);
         testLength(i);
     }
+
+    return 0;
 }
 #endif
