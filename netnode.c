@@ -367,7 +367,7 @@ int open_server_socket(int port) {
  *    a file descriptor that can be used to read or write to the client
  *****************************************************************************/
 int accept_server_socket(int sock) {
-    unsigned int otheraddrlen;
+    socklen_t otheraddrlen;
     struct sockaddr_in otheraddr;
     int fd;
 
@@ -582,7 +582,7 @@ int get_sockaddr(void *vp_sock_addr, char *host, int port) {
 
     initwin();
 
-    if (isdigit(*host)) {
+    if (isdigit((int) *host)) {
         if (inet_aton(host, &in_addr) == 0)
             return -1;
 
@@ -1695,7 +1695,7 @@ int main(int argc, char **argv) {
     #endif
     int fd, max_fd;
     int my_server_port = -1;
-    unsigned int sock_addr_len;
+    socklen_t sock_addr_len;
     int unconnected_tcp_client;
     int c;
     int i, j, fd_ind, result;
