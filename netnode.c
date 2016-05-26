@@ -1959,7 +1959,7 @@ int main(int argc, char **argv) {
     }
 
     if (do_udp_pinger) {
-        for (i = 0; i < fd_count-1; i++)
+        for (i = 0; i < fd_count; i++)
             if (fds[i]->connect_type == connect_udp_client)
                 fork_udp_pinger(fds[i]->fd);
     }
