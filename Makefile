@@ -1,8 +1,12 @@
-netnode: netnode.c netnode.h print_message.o
-	gcc -g -Wall -DMAIN -o netnode netnode.c print_message.o
+all: netnode
 
-print_message.o: print_message.c print_message.h
-	gcc -g -Wall -c print_message.c
+test: hexdump_test
+
+netnode: netnode.c netnode.h hexdump.o
+	gcc -g -Wall -DMAIN -o netnode netnode.c hexdump.o
+
+hexdump.o: hexdump.c hexdump.h
+	gcc -g -Wall -c hexdump.c
 
 netnode.o: netnode.c netnode.h
 	gcc -g -Wall -c netnode.c
@@ -10,5 +14,8 @@ netnode.o: netnode.c netnode.h
 example: example.c netnode.o netnode.h
 	gcc -g -Wall -o example example.c netnode.o
 
+hexdump_test:  hexdump.c
+	gcc -g -Wall -DUNIT_TEST -o hexdump_test hexdump.c
+
 clean:
-	rm -f *.o *.gch netnode example
+	rm -f *.o *.gch netnode example hexdump_test
