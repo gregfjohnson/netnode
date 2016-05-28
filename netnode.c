@@ -808,7 +808,6 @@ static char echo = 0;
 static char do_fork = 0;
 static int close_inbound_tcp_clients = 1;
 
-static int my_udp_server_fd = -1;
 static char do_udp_pinger = 1;
 
 static int die_if_lose_server = 0;
@@ -857,7 +856,12 @@ static int fds_closed = 0;
  * and send information back to them.
  */
 #define MAX_UDP_CLIENT 256
-struct sockaddr_in udp_client_sockaddr[MAX_UDP_CLIENT];
+typedef struct {
+    struct sockaddr_in sockaddr;
+    int fd;
+} sockaddr_with_fd_t;
+
+sockaddr_with_fd_t udp_client_sockaddr[MAX_UDP_CLIENT];
 static int udp_client_count = 0;
 
 static fd_t *marked = NULL;
@@ -1319,7 +1323,7 @@ static void do_output(int fd_ind, byte *buffer, int length, char got_udp_msg,
             continue;
         }
 
-        if (fds[i]->fd == my_udp_server_fd) {
+        if (fds[i]->connect_type == connect_udp_server) {
             continue;
         }
 
@@ -1429,21 +1433,21 @@ static void do_output(int fd_ind, byte *buffer, int length, char got_udp_msg,
 
     /* send received message to udp clients */
     for (i = 0; i < udp_client_count; i++) {
-        sock_addr_len = sizeof(udp_client_sockaddr[i]);
+        sock_addr_len = sizeof(udp_client_sockaddr[i].sockaddr);
 
         /* if the message came from this guy and we're not in echo
          * mode, don't send it to him.
          */
         if (got_udp_msg
-            && memcmp(&src_fd->msg_sockaddr, &udp_client_sockaddr[i],
+            && memcmp(&src_fd->msg_sockaddr, &udp_client_sockaddr[i].sockaddr,
                     sizeof(src_fd->msg_sockaddr)) == 0
             && !echo)
         {
             continue;
         }
 
-        result = sendto(my_udp_server_fd, buffer, length, MSG_NOSIGNAL,
-                (struct sockaddr *) &udp_client_sockaddr[i],
+        result = sendto(udp_client_sockaddr[i].fd, buffer, length, MSG_NOSIGNAL,
+                (struct sockaddr *) &udp_client_sockaddr[i].sockaddr,
                 sock_addr_len);
 
         if (result < 1) {
@@ -1456,8 +1460,8 @@ static void do_output(int fd_ind, byte *buffer, int length, char got_udp_msg,
             fprintf(stderr, "wrote to udp client %x:%d; got result "
                     "%d\n",
                     (unsigned int)
-                        udp_client_sockaddr[i].sin_addr.s_addr,
-                    ntohs(udp_client_sockaddr[i].sin_port),
+                        udp_client_sockaddr[i].sockaddr.sin_addr.s_addr,
+                    ntohs(udp_client_sockaddr[i].sockaddr.sin_port),
                     result);
         }
     }
@@ -1929,7 +1933,6 @@ int main(int argc, char **argv) {
                     }
 
                     add_fd(fd, true, false, false, false, connect_udp_server);
-                    my_udp_server_fd = fd;
 
                 } else {
                     int accept_socket = open_server_socket(my_server_port);
@@ -2115,11 +2118,11 @@ int main(int argc, char **argv) {
                  * our list of clients and include them in our broadcasts
                  * of future messages.
                  */
-                if (read_fd == my_udp_server_fd && length >= 0) {
+                if (fds[fd_ind]->connect_type == connect_udp_server && length >= 0) {
                     found = 0;
                     for (i = 0; i < udp_client_count; i++) {
                         if (memcmp(&fds[fd_ind]->msg_sockaddr,
-                            &udp_client_sockaddr[i],
+                            &udp_client_sockaddr[i].sockaddr,
                             sizeof(fds[fd_ind]->msg_sockaddr)) == 0)
                         {
                             found = 1;
@@ -2136,16 +2139,17 @@ int main(int argc, char **argv) {
                             udp_client_count--;
                         }
 
-                        udp_client_sockaddr[udp_client_count++]
+                        udp_client_sockaddr[udp_client_count].fd = fds[fd_ind]->fd;
+                        udp_client_sockaddr[udp_client_count++].sockaddr
                             = fds[fd_ind]->msg_sockaddr;
                     }
                 }
 
-                if (read_fd == my_udp_server_fd && length < 0) {
+                if (fds[fd_ind]->connect_type == connect_udp_server && length < 0) {
                     found = 0;
                     for (i = 0; i < udp_client_count; i++) {
                         if (memcmp(&fds[fd_ind]->msg_sockaddr,
-                            &udp_client_sockaddr[i],
+                            &udp_client_sockaddr[i].sockaddr,
                             sizeof(fds[fd_ind]->msg_sockaddr)) == 0)
                         {
                             found = 1;
