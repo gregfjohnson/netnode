@@ -6,52 +6,16 @@
  *
  * Description : set up a communication graph.
  *               The program can be used to set up a graph of
- *               communicating netnode instances of different machines.  
- *
- * Usage:  netnode [-P port] [-U port] [-p [host:]port]* [-u [host:]port]* \
- *                 [-k] [-e] [-f] [-b]
- *
- *   -P port:  tcp server port to open
- *   -p [host:]port:  connect as tcp client to host:port
- *   -U port:  udp server port to open
- *   -u [host:]port:  communicate as udp client to host:port
- *   -l port:  udp server port to open for listening but no sending
- *   -w interface:  communicate to raw interface (eth1, wlan0, etc.)
- *   -s:  open a file (such as /dev/ttyS0 or a named pipe)
- *   -m:  mark the previous command-line interface
- *   -x:  exclude output from the previous command-line interface to the
- *             marked command-line interface.
- *             example:  server -P 6622 -p 7777 -m -s /dev/ttyS0 -x
- *                       would exclude output from /dev/ttyS0 to port 7777.
- *                       so, another program that connected to the 7777 server
- *                       would only see traffic coming to port 6622 and would
- *                       not see traffic from /dev/ttyS0.
- *   -k:  connect as "client" to keyboard (stdin, stdout)
- *   -v:  verbose debug output
- *   -e:  echo every message back to clients
- *   -f:  for a tcp connection, fork a separate process for each client
- *   -a:  die_if_lose_server
- *   -D:  dontwait
- *   -X n:  exclude port n from previous interface
- *   -N:  time out bad client
- *   -F:  don't do udp pinger.
- *   -i:  input only
- *   -o:  output only
- *   -t:  text output
- *   -b:  hex output
- *   -T:  timestamp and direction
+ *               communicating netnode instances on different machines.  
  *
  * Return values:
  *    0:  normal exit
  *    1:  error exit
- *
- * 03/21/2007 gfj - Created.
- * 03/28/2007 gfj - added udp, server forking
- * 04/02/2007 gfj - added multiple clients, sending data among them
  ****************************************************************************/
 
 #include <string.h>
 #include <stdio.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <unistd.h>
@@ -64,25 +28,19 @@
 #include <ctype.h>
 #include "hexdump.h"
 
-#ifdef WINDOWS
-    #include "windows.h"
-#else
-    #include <sys/uio.h>
-    #include <sys/socket.h>
-    #include <sys/select.h>
-    #include <netinet/in.h>
-     #include <arpa/inet.h>
-    #include <netdb.h>
-    #include <unistd.h>
-#endif
+#include <sys/uio.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <unistd.h>
 
-#ifdef LINUX
-    #include <net/if.h>
-    #include <sys/ioctl.h>
-    #ifdef LINUX_RAW
-        #include <linux/if_packet.h>
-        #include <linux/if_ether.h>   /* The L2 protocols */
-    #endif
+#include <net/if.h>
+#include <sys/ioctl.h>
+#ifdef LINUX_RAW
+    #include <linux/if_packet.h>
+    #include <linux/if_ether.h>   /* The L2 protocols */
 #endif
 
 #include <sys/types.h>
@@ -104,10 +62,12 @@
 #define BUFSIZE 65536
 #define MAX_EXCLUDE 16
 
-#define false 0
-#define true 1
-
 typedef unsigned char byte;
+
+byte buffer1[BUFSIZE];
+byte buffer2[BUFSIZE];
+
+byte *buffer = buffer1;
 
 #ifndef MSG_NOSIGNAL
     #define MSG_NOSIGNAL 0
@@ -115,21 +75,27 @@ typedef unsigned char byte;
 
 typedef enum {
     connect_unknown = 0,
+
     connect_udp_server,
     connect_udp_client,
-    connect_udp_listener,
-    connect_tcp_server,             // the -P port to which tcp clients connect
+
+    connect_tcp_server,             // the -P port to which clients connect
     connect_tcp_client,             // we are a "-p" tcp client
-    connect_tcp_inbound_client,     // this is a connect to our "-P"
+    connect_tcp_inbound_client,     // client connection to our "-P"
+
+    connect_tcp_proxy_server,       // my tcp server port for proxy clients
+    connect_tcp_proxy_client,
+    connect_tcp_proxy_inbound_client,
+
     connect_raw_client,
     connect_pcap_client,
+
     connect_keyboard,
     connect_file,
+
 } connect_type_t;
 
 typedef struct _fd_t {
-
-    /* eventually move all individual bits below to this guy. */
     connect_type_t connect_type;
 
     /* file descriptor of this connection */
@@ -161,7 +127,7 @@ typedef struct _fd_t {
         pcap_t *adhandle;
     #endif
 
-    /* the hosts and ports of udp servers for whom we are a client based on
+    /* the host and port of udp server for whom we are a client based on
      * '-u host:port' command-line arguments
      */
     struct sockaddr_in udp_sockaddr;
@@ -183,18 +149,11 @@ typedef struct _fd_t {
     int port;
     char *host;
 
+    struct _fd_t *proxy_partner;
+
     int (*read)(server_fd_ptr_t voidp_fd_desc, byte *buf, int buf_len);
     int (*write)(server_fd_ptr_t voidp_fd_desc, byte *buf, int buf_len);
     int (*close)(server_fd_ptr_t voidp_fd_desc);
-    int (*have_input)(server_fd_ptr_t voidp_fd_desc);
-
-    /* pointer to a packet source that we are not supposed to send
-     * packets out from.
-     */
-    struct _fd_t *exclude_out;
-
-    int exclude_port_count;
-    int exclude_ports[MAX_EXCLUDE];
 
     int error_count;
     long long last_packet_recvd;
@@ -233,35 +192,8 @@ server_fd_ptr_t server_fd_new() {
     return (server_fd_ptr_t) result;
 }
 
-#ifdef WINDOWS
-    static char initwin_done = false;
-
-    static void initwin(void) {
-        WORD version;
-        WSADATA wsa_data;
-        int err;
-        if (initwin_done) {
-            return;
-        }
-
-        fprintf(stderr, "initwin..\n");
-        version = MAKEWORD(2,2);
-        err = WSAStartup(version, &wsa_data);
-        if (err != 0) {
-            fprintf(stderr, "WSAStartup failed.\n");
-            exit(1);
-        }
-        fprintf(stderr, "initwin done..\n");
-        initwin_done = true;
-    }
-#else
-    static void initwin(void) {}
-#endif
-
 /*****************************************************************************
- * Function name:  int do_open_server_socket(int port)
- * Description:
- *    open a udp or tcp server socket
+ * Open a udp or tcp server socket
  * Args:
  *    int port:  the server port to open
  * Returns:
@@ -270,10 +202,6 @@ server_fd_ptr_t server_fd_new() {
 static int do_open_server_socket(int port, int connection_type) {
     int sock;
     struct sockaddr_in sin;
-
-    #ifdef WINDOWS
-        initwin();
-    #endif
 
     /* attempt to open a socket */
 
@@ -332,9 +260,7 @@ static int do_open_server_socket(int port, int connection_type) {
 } /* do_open_server_socket() */
 
 /*****************************************************************************
- * Function name:  int open_server_socket(int port)
- * Description:
- *    open a server socket
+ * Open a udp server socket
  * Args:
  *    int port:  the server port to open
  * Returns:
@@ -345,9 +271,7 @@ int open_udp_server_socket(int port) {
 }
 
 /*****************************************************************************
- * Function name:  int open_server_socket(int port)
- * Description:
- *    open a server socket
+ * Open a tcp server socket
  * Args:
  *    int port:  the server port to open
  * Returns:
@@ -358,9 +282,7 @@ int open_server_socket(int port) {
 }
 
 /*****************************************************************************
- * Function name:  int accept_server_socket(int sock)
- * Description:
- *    accept an incoming connection to our port from a client
+ * Accept an incoming connection to our tcp port from a client
  * Args:
  *    int sock:  the server socket from open_server_socket()
  * Returns:
@@ -378,12 +300,10 @@ int accept_server_socket(int sock) {
 
     return fd;
 
-} /* accept_server_socket() */
+}
 
 /*****************************************************************************
- * Function name:  void check_valid(int check, char *format, ...)
- * Description:
- *    if check is true, do nothing.  else, print error message and exit(1).
+ * If check is true, do nothing.  else, print error message and exit(1).
  * Args:
  *    check:  boolean condition to check
  *    char *format, ...: fprintf-compatible error message
@@ -402,16 +322,13 @@ static void check_valid(int check, char *format, ...) {
 }
 
 /*****************************************************************************
- * Function name:  void get_host_ports(char **host, int *port, int *src_port,
- *                                     char *arg)
- * Description:
- *    parse arg to get host, port, and source port.  syntax of arg:
- *    [[source_port:]host:]dest_port
+ * Parse arg to get host, port, and source port.  syntax of arg:
+ * [[source_port:]host:]dest_port
  *
- *    if no host or null host, return "localhost" in host parameter.
- *    if no source_port, return -1 in src_port parameter.
+ * if no host or null host, return "localhost" in host parameter.
+ * if no source_port, return -1 in src_port parameter.
  *
- *    NOTE:  this function modifies arg in place.  fix this.
+ * NOTE:  this function modifies arg in place.
  * Args:
  *    host:      out parm pointing to host name
  *    port:      out parm pointing to destination port
@@ -470,8 +387,7 @@ int get_host_ports(char **host, int *port, int *src_port, char *arg) {
 
 #ifdef LINUX_RAW
 
-int read_raw_interface(server_fd_ptr_t voidp_fd_desc, byte *buf,
-    int buf_len)
+int read_raw_interface(server_fd_ptr_t voidp_fd_desc, byte *buf, int buf_len)
 {
     socklen_t recv_arg_len;
     struct sockaddr_ll recv_arg;
@@ -563,11 +479,7 @@ void setup_raw_interface(char *dev_name, server_fd_ptr_t voidp_fd_desc) {
 #endif
 
 /*****************************************************************************
- * Function name:  int get_sockaddr(struct sockaddr_in *sock_addr,
- *                                  char *host,
- *                                  int port)
- * Description:
- *    populate sock_addr with port and IP address of host
+ * Populate sock_addr with port and IP address of host
  * Args:
  *    struct sockaddr_in *sock_addr:  the struct to populate
  *    char *host:  the name (or text-string IP address) of the host
@@ -579,8 +491,6 @@ int get_sockaddr(void *vp_sock_addr, char *host, int port) {
     struct sockaddr_in *sock_addr = (struct sockaddr_in *) vp_sock_addr;
     unsigned long host_ip_address;
     struct in_addr in_addr;
-
-    initwin();
 
     if (isdigit((int) *host)) {
         if (inet_aton(host, &in_addr) == 0)
@@ -614,14 +524,10 @@ int get_sockaddr(void *vp_sock_addr, char *host, int port) {
     #endif
 
     return 0;
-} /* get_sockaddr */
+}
 
 /*****************************************************************************
- * Function name:  int do_open_client_socket(char *host,
- *                                           int port,
- *                                           int connection_type)
- * Description:
- *    connect to a udp or tcp server on the given host at the given port
+ * Connect to a udp or tcp server on the given host at the given port
  * Args:
  *    char *host:  the name (or text-string IP address) of the host
  *    int port:    the port to connect to on the host
@@ -638,8 +544,6 @@ static int do_open_client_socket(char *host,
     int                 sock;
     int res;
  
-    initwin();
-
     /* attempt to create a new socket */
 
     #ifdef VERBOSE
@@ -684,10 +588,7 @@ static int do_open_client_socket(char *host,
 }
 
 /*****************************************************************************
- * Function name:  int open_client_socket(char *host,
- *                                        int port)
- * Description:
- *    connect to a tcp server on the given host at the given port
+ * Connect to a tcp server on the given host at the given port
  * Args:
  *    char *host:  the name (or text-string IP address) of the host
  *    int port:    the port to connect to on the host
@@ -700,10 +601,7 @@ int open_client_socket(char *host, int port) {
 }
 
 /*****************************************************************************
- * Function name:  int open_client_socket(char *host,
- *                                        int port)
- * Description:
- *    connect to a udp server on the given host at the given port
+ * Connect to a udp server on the given host at the given port
  * Args:
  *    char *host:  the name (or text-string IP address) of the host
  *    int port:    the port to connect to on the host
@@ -735,8 +633,7 @@ int write_udp_client(server_fd_ptr_t voidp_fd_desc, byte *buffer, int buf_len) {
     return result;
 }
 
-void setup_udp_client_interface(char *host_port, server_fd_ptr_t voidp_fd_desc)
-{
+void setup_udp_client_interface(char *host_port, server_fd_ptr_t voidp_fd_desc) {
     int port;
     char *host;
     int udp_src_port = -1;
@@ -748,10 +645,9 @@ void setup_udp_client_interface(char *host_port, server_fd_ptr_t voidp_fd_desc)
     fd_desc->fd = open_udp_client_socket(host, port);
     check_valid(fd_desc->fd >= 0, "open_udp_client_socket failed");
 
-    /* see if host is valid */
     check_valid(get_sockaddr(
-            &fd_desc->udp_sockaddr, host, port) >= 0,
-            "invalid host '%s'", host);
+                &fd_desc->udp_sockaddr, host, port) >= 0,
+                "invalid host '%s'", host);
 
     if (udp_src_port != -1) {
         struct sockaddr_in src_port;
@@ -806,7 +702,6 @@ static char time_and_source = false;
 
 static char echo = 0;
 static char do_fork = 0;
-static int close_inbound_tcp_clients = 1;
 
 static char do_udp_pinger = 1;
 
@@ -858,25 +753,17 @@ static int fds_closed = 0;
 #define MAX_UDP_CLIENT 256
 typedef struct {
     struct sockaddr_in sockaddr;
-    int fd;
+    fd_t *udp_server_fd_desc;
 } sockaddr_with_fd_t;
 
 sockaddr_with_fd_t udp_client_sockaddr[MAX_UDP_CLIENT];
 static int udp_client_count = 0;
 
-static fd_t *marked = NULL;
-
-/* convenience function for setting breakpoints in debuggers */
-static void server_bp1() {}
-
 static void packet_recvd(fd_t *fd, int result);
 
 /*****************************************************************************
- * Function name:  void add_fd(int fd, char udp_target, char ima_client,
- *                             char pcap_client, char raw_client,
- *                             connect_type_t connect_type)
- * Description:
- *    add a file descriptor to the fds[] array; error-exit if too many.
+ * Add a file descriptor to the fds[] array; error-exit the program if too many.
+ *     (Look before you leap.)
  * Args:
  *    fd:  file descriptor of newly opened connection.
  *    udp_target:  we are a command-line udp client or a command-line
@@ -892,9 +779,11 @@ static void packet_recvd(fd_t *fd, int result);
  * Returns:
  *    no return value.
  *****************************************************************************/
-static void add_fd(int fd, char udp_target,
-                   char ima_client,
-                   char pcap_client, char raw_client,
+static void add_fd(int            fd,
+                   char           udp_target,
+                   char           ima_client,
+                   char           pcap_client,
+                   char           raw_client,
                    connect_type_t connect_type)
 {
     if (fd_count >= MAX_FD) {
@@ -907,20 +796,22 @@ static void add_fd(int fd, char udp_target,
     fds[fd_count]->connect_type = connect_type;
     fds[fd_count]->fd = fd;
 
-    fds[fd_count]->no_output = no_output;
-    no_output = false;
+    // options for all interfaces
+        fds[fd_count]->no_output = no_output;
+        no_output = false;
 
-    fds[fd_count]->time_and_source = time_and_source;
-    time_and_source = false;
+        fds[fd_count]->no_input = no_input;
+        no_input = false;
 
-    fds[fd_count]->no_input = no_input;
-    no_input = false;
+    // options for stdout
+        fds[fd_count]->time_and_source = time_and_source;
+        time_and_source = false;
 
-    fds[fd_count]->hex_msgs = hex_msgs;
-    hex_msgs = false;
+        fds[fd_count]->hex_msgs = hex_msgs;
+        hex_msgs = false;
 
-    fds[fd_count]->text_msgs = text_msgs;
-    text_msgs = false;
+        fds[fd_count]->text_msgs = text_msgs;
+        text_msgs = false;
 
     fds[fd_count]->udp_target = udp_target;
     fds[fd_count]->ima_client = ima_client;
@@ -929,7 +820,6 @@ static void add_fd(int fd, char udp_target,
     fds[fd_count]->read = NULL;
     fds[fd_count]->write = NULL;
     fds[fd_count]->close = NULL;
-    fds[fd_count]->have_input = NULL;
     fds[fd_count]->fd_active = 1;
     fds[fd_count]->priority = 1;
 
@@ -937,12 +827,10 @@ static void add_fd(int fd, char udp_target,
 }
 
 /*****************************************************************************
- * Function name:  void compact_fds()
- * Description:
- *    compact active fd records to the left in the fds[] array.
- *    we look at fds[i]->fd_active, and garbage collect the false ones.
- *    so as not to have to run over the whole array every time, fds_closed
- *    is set whenever an fd_active field is made false.
+ * Compact active fd records to the left in the fds[] array.
+ * we look at fds[i]->fd_active, and garbage collect the false ones.
+ * so as not to have to run over the whole array every time, fds_closed
+ * is set whenever an fd_active field is made false.
  * Args:
  *    none
  * Returns:
@@ -1015,8 +903,7 @@ static int write_file_interface(server_fd_ptr_t voidp_fd_desc,
     return write(fd_desc->fd, buf, buf_len);
 }
 
-static void setup_file_interface(char *dev_name, server_fd_ptr_t voidp_fd_desc)
-{
+static void setup_file_interface(char *dev_name, server_fd_ptr_t voidp_fd_desc) {
     int flags = O_RDWR;
     fd_t *fd_desc = (fd_t *) voidp_fd_desc;
 
@@ -1030,9 +917,7 @@ static void setup_file_interface(char *dev_name, server_fd_ptr_t voidp_fd_desc)
 
 #ifdef PCAP_LIB
 /*****************************************************************************
- * Function name:  int open_pcap(char *name)
- * Description:
- *    open the pcap windows interface.
+ * Open the pcap windows interface.
  * Args:
  *    name:  the name of the interface to open.
  * Returns:
@@ -1080,12 +965,14 @@ void server_exit() {
     int i;
 
     for (i = 0; i < fd_count; i++) {
-        if (!fds[i]->fd_active) {
-            continue;
-        }
+        if (fds[i]->fd_active) {
 
-        if (fds[i]->close) {
-            fds[i]->close(fds[i]);
+            if (fds[i]->close != NULL) {
+                fds[i]->close(fds[i]);
+
+            } else if (fds[i]->fd >= 0) {
+                close(fds[i]->fd);
+            }
         }
     }
 
@@ -1093,85 +980,65 @@ void server_exit() {
 }
 
 /*****************************************************************************
- * Function name:  void close_tcp_connection(int fd_ind)
- * Description:
- *    close a tcp connection
+ * Close a tcp connection, and exit the program
+ *     if global do_fork is true or fd_desc->ima_client.
  * Args:
  *    name:  the name of the interface to close.
  * Returns:
  *    0 on success, -1 on failure
  *****************************************************************************/
-static void close_tcp_connection(int fd_ind, char *title) {
-    if (verbose > 0)
+static void close_tcp_connection(struct _fd_t *fd_desc, char *title) {
+    if (verbose > 0) {
         fprintf(stderr, "close_tcp_connection from %s; fd %d..\n", title,
-                fds[fd_ind]->fd);
+                fd_desc->fd);
+    }
 
-    if (fds[fd_ind]->connect_type != connect_tcp_server
-        && fds[fd_ind]->connect_type != connect_tcp_client
-        && fds[fd_ind]->connect_type != connect_tcp_inbound_client)
+    if (!fd_desc->fd_active) return;
+
+    if (   fd_desc->connect_type != connect_tcp_server
+        && fd_desc->connect_type != connect_tcp_client
+        && fd_desc->connect_type != connect_tcp_inbound_client
+        && fd_desc->connect_type != connect_tcp_proxy_server
+        && fd_desc->connect_type != connect_tcp_proxy_client
+        && fd_desc->connect_type != connect_tcp_proxy_inbound_client)
     {
         return;
     }
 
-    close(fds[fd_ind]->fd);
+    close(fd_desc->fd);
 
-    if (fds[fd_ind]->fd_active) {
-        fds[fd_ind]->fd_active = 0;
-        fds_closed = true;
-    }
+    fd_desc->fd_active = 0;
+    fds_closed = true;
 
     if (do_fork) {
         server_exit(0);
 
-    } else if (fds[fd_ind]->ima_client) {
-        if (fds[fd_ind]->fd != 0) {
-            fprintf(stderr, "server stopped\n");
-        }
+    } else if (fd_desc->ima_client) {
         server_exit(0);
     }
 
     fprintf(stderr, "client stopped\n");
 }
 
-static void do_close_inbound_tcp_clients(void) {
-    int i;
-    for (i = 0; i < fd_count; ++i) {
-        if (fds[i]->connect_type == connect_tcp_inbound_client) {
-            close_tcp_connection(i, "inbound tcp client");
-        }
-    }
-}
-
-static void tcp_server_closed(void) {
-    fprintf(stderr, "tcp server closed.\n");
-
-    if (close_inbound_tcp_clients)
-        do_close_inbound_tcp_clients();
-}
-
 /*****************************************************************************
- * Function name:  void reopen_tcp_connection(int fd_ind)
- * Description:
- *    reopen a tcp connection
+ * Reset a tcp connection.
  * Args:
- *    name:  the name of the interface to open.
+ *    fd_ind:  index in fds[] of the connection to reset.
+ *    title:   debug message to print if verbose output.
  * Returns:
- *    0 on success, -1 on failure
+ *    no return value.
  *****************************************************************************/
-static void reopen_tcp_connection(int fd_ind, char *title) {
+static void reset_tcp_connection(int fd_ind, char *title) {
     fd_t *fd_struct = fds[fd_ind];
 
-    if (fd_struct->connect_type != connect_tcp_client) {
+    if (   fd_struct->connect_type != connect_tcp_client
+        && fd_struct->connect_type != connect_tcp_proxy_client)
+    {
         if (verbose > 0)
             fprintf(stderr, "not a connect_tcp_client; return..\n");
 
-        close_tcp_connection(fd_ind, title);
+        close_tcp_connection(fds[fd_ind], title);
         return;
-    }
-
-    if (fd_struct->fd >= 0) {
-        printf("ick.  tcp server closed connection.  set fd to -1..\n");
-        tcp_server_closed();
     }
 
     close(fd_struct->fd);
@@ -1196,43 +1063,106 @@ double time__usec() {
     return (double) now / 1000000.;
 }
 
-static void print_time_and_source(int sourceFd) {
-    double now = time__usec();
-    printf("%12.6lf >> %d >> ", now - start_time, sourceFd);
+static void close_proxy_tcp_connection(fd_t *fd_desc) {
+    if (fd_desc->fd != -1) {
+        close(fd_desc->fd);
+        fd_desc->fd = -1;
+        fd_desc->fd_active = 0;
+        fds_closed = true;
+        close_proxy_tcp_connection(fd_desc->proxy_partner);
+    }
 }
 
-static void print_text_msg(byte *buffer, int length) {
+static int print_time_and_source(char *outBuf, int outBufLen, int sourceFd) {
+    int resultLen;
+    double now = time__usec();
+    resultLen = snprintf(outBuf, outBufLen, "%12.6lf >> %d >> ", now - start_time, sourceFd);
+    if (resultLen > outBufLen - 1) {
+        resultLen = outBufLen - 1;
+    }
+    return resultLen;
+}
+
+static int print_text_msg(byte *outBuf, int outBufLen, byte *buffer, int length) {
     int i;
+    int resultLen = 0;
 
     for (i = 0; i < length; i++) {
+        if (resultLen >= outBufLen - 1) break;
+
         char c = buffer[i];
 
-        if (c == 0x0a) {
-            printf("\n");
-
-        } else if (c == 0x0d) {
-            printf("\r");
-
-        } else if (isprint((int) c)) {
-            printf("%c", c);
+        if (isprint((int) c) || c == '\n') {
+            outBuf[resultLen++] = c;
+            --outBufLen;
 
         } else {
-            printf("\\0x%02x", 0xff & (unsigned int) c);
+            int len;
+            len = snprintf((char *) &outBuf[resultLen], outBufLen, "\\0x%02x", 0xff & (unsigned int) c);
+            if (len > outBufLen - 1) {
+                len = outBufLen - 1;
+            }
+            resultLen += len;
+            outBufLen -= len;
         }
     }
-    fflush(stdout);
+
+    if (outBufLen > 0) {
+        outBuf[resultLen] = '\0';
+    }
+
+    return resultLen;
 }
 
-static void print_hex_msg(byte *buffer, int length) {
-    fprintf(stderr, "out message:\n");
-    hexdump(buffer, length);
+void getOutputMessage(byte **outBuffer, int *outLen, byte *buffer, int length, 
+                      int time_and_source,
+                      int text_msgs,
+                      int hex_msgs,
+                      int sourceFd)
+{
+    int bufLen = BUFSIZE;
+
+    if (!time_and_source && !hex_msgs && !text_msgs) {
+        *outBuffer = buffer;
+        *outLen = length;
+        return;
+    }
+
+    *outBuffer = buffer2;
+
+    byte *outBuf = *outBuffer;
+
+    if (time_and_source) {
+        int len = print_time_and_source((char *) outBuf, bufLen, sourceFd);
+        bufLen -= len;
+        outBuf += len;
+    }
+
+    if (hex_msgs) {
+        int len = hexdump((char *) outBuf, bufLen, buffer, length);
+        bufLen -= len;
+        outBuf += len;
+
+    } else if (text_msgs) {
+        int len = print_text_msg(outBuf, bufLen, buffer, length);
+        bufLen -= len;
+        outBuf += len;
+
+    } else {
+        for (int i = 0; i < length; ++i) {
+            if (bufLen <= 1) break;
+            *outBuf++ = *buffer++;
+            --bufLen;
+        }
+        if (bufLen > 0)
+            *outBuf = '\0';
+    }
+
+    *outLen = outBuf - *outBuffer;
 }
 
 /*****************************************************************************
- * Function name:  void do_output(int fd_ind, byte *buffer, int length,
- *                                char got_udp_msg)
- * Description:
- *    send the packet to every destination that should receive it.
+ * Send the packet to every destination that should receive it.
  * Args:
  *    fd_ind:  index in fds array of source of the packet
  *    buffer:  the packet to send
@@ -1241,30 +1171,34 @@ static void print_hex_msg(byte *buffer, int length) {
  * Returns:
  *    no return value.
  *****************************************************************************/
-static void do_output(int fd_ind, byte *buffer, int length, char got_udp_msg,
+static void do_output(int read_fd_ind, byte *buffer, int length, char got_udp_msg,
     int errno_arg)
 {
-    int result;
-    int i, j;
+    int          result;
+    int          i;
     unsigned int sock_addr_len;
-    int read_fd = fds[fd_ind]->fd;
-    fd_t *src_fd = fds[fd_ind];
+    int          read_fd        = fds[read_fd_ind]->fd;
+    fd_t*        read_fd_desc   = fds[read_fd_ind];
+    byte*        outBuffer;
+    int          outLength;
 
     if (debug[0]) {
+        char outBuf[256];
         fprintf(stderr, "do_output; read fd %d got result %d", read_fd, length);
         if (got_udp_msg) {
             fprintf(stderr, " from udp client %08x:%d",
-                    (unsigned int) fds[fd_ind]->msg_sockaddr.sin_addr.s_addr,
-                    ntohs(fds[fd_ind]->msg_sockaddr.sin_port));
+                    (unsigned int) fds[read_fd_ind]->msg_sockaddr.sin_addr.s_addr,
+                    ntohs(fds[read_fd_ind]->msg_sockaddr.sin_port));
         }
         fprintf(stderr, "\n");
-        hexdump(buffer, length);
+        hexdump(outBuf, 256, buffer, length);
+        fprintf(stderr, "%s\n", outBuf);
     }
 
-    /* if read failed and we are doing tcp, close the connection */
+    /* if read failed or gave EOF.. */
     if (length <= 0) {
-        if (fds[fd_ind]->connect_type == connect_file
-            || fds[fd_ind]->connect_type == connect_keyboard)
+        if (   fds[read_fd_ind]->connect_type == connect_file
+            || fds[read_fd_ind]->connect_type == connect_keyboard)
         {
             if (verbose > 0)
                 fprintf(stderr, "got eof (0-length read) on stdin or file.  "
@@ -1273,11 +1207,16 @@ static void do_output(int fd_ind, byte *buffer, int length, char got_udp_msg,
             server_exit(0);
         }
 
-        if (!got_udp_msg
-            && !fds[fd_ind]->raw_client
-            && !fds[fd_ind]->pcap_client)
+        if (   fds[read_fd_ind]->connect_type == connect_tcp_proxy_client
+            || fds[read_fd_ind]->connect_type == connect_tcp_proxy_inbound_client)
         {
-            fds[fd_ind]->error_count++;
+            close_proxy_tcp_connection(fds[read_fd_ind]);
+
+        } else if (!got_udp_msg
+            && !fds[read_fd_ind]->raw_client
+            && !fds[read_fd_ind]->pcap_client)
+        {
+            fds[read_fd_ind]->error_count++;
 
             if (verbose > 0)
                 fprintf(stderr, "1 problem with sendto:  %s; errno %d; "
@@ -1288,7 +1227,7 @@ static void do_output(int fd_ind, byte *buffer, int length, char got_udp_msg,
                 server_exit(0);
 
             if (errno_arg != EAGAIN)
-                reopen_tcp_connection(fd_ind, "do_output 1");
+                reset_tcp_connection(read_fd_ind, "do_output 1");
         }
 
         return;
@@ -1311,15 +1250,15 @@ static void do_output(int fd_ind, byte *buffer, int length, char got_udp_msg,
             continue;
         }
 
+        if (fds[i]->fd == 1 && read_fd == 0 && !echo) {
+            continue;
+        }
+
         if (fds[i]->connect_type == connect_tcp_server) {
             continue;
         }
 
-        if (fds[i]->connect_type == connect_udp_listener) {
-            continue;
-        }
-
-        if (src_fd->exclude_out == fds[i]) {
+        if (fds[i]->connect_type == connect_tcp_proxy_server) {
             continue;
         }
 
@@ -1327,60 +1266,47 @@ static void do_output(int fd_ind, byte *buffer, int length, char got_udp_msg,
             continue;
         }
 
-        if (fds[i]->exclude_port_count > 0) {
-            unsigned int found = false;
-            for (j = 0; j < fds[i]->exclude_port_count; j++) {
-                if (fds[i]->exclude_ports[j]
-                    == ntohs(fds[fd_ind]->msg_sockaddr.sin_port))
-                {
-                    found = true;
-                    break;
-                }
-            }
-            if (found)
-                continue;
+        if (  (fds[i]->connect_type == connect_tcp_proxy_client
+            || fds[i]->connect_type == connect_tcp_proxy_inbound_client)
+            && fds[i]->proxy_partner != fds[read_fd_ind])
+        {
+            continue;
         }
 
+        getOutputMessage(&outBuffer, &outLength, buffer, length, 
+                         fds[i]->time_and_source,
+                         fds[i]->text_msgs,
+                         fds[i]->hex_msgs,
+                         read_fd);
+
         if (fds[i]->connect_type == connect_keyboard) {
-            if (fds[i]->text_msgs) {
-                if (fds[i]->time_and_source) {
-                    print_time_and_source(read_fd);
-                }
-                print_text_msg(buffer, length);
-
-            } else if (fds[i]->hex_msgs) {
-                print_hex_msg(buffer, length);
-
-            } else {
-                /* write to stdout */
-                if (write(1, buffer, length) < 0) {
-                    if (verbose > 0) {
-                        fprintf(stderr, "problem with write:  %s\n",
-                                strerror(errno));
-                    }
+            if (write(1, outBuffer, outLength) < 0) {
+                if (verbose > 0) {
+                    fprintf(stderr, "problem with write:  %s\n",
+                            strerror(errno));
                 }
             }
         }
 
         if (fds[i]->write != NULL) {
-            result = fds[i]->write(fds[i], buffer, length);
+            result = fds[i]->write(fds[i], outBuffer, outLength);
         }
 
         #ifdef PCAP_LIB
         else if (fds[i]->pcap_client) {
             if (debug[1]) {
                 fprintf(stderr, "try pcap_sendpacket '%s' (len %d)..\n",
-                        buffer, length);
+                        outBuffer, outLength);
             }
-            if (length < 14) {
+            if (outLength < 14) {
                 fprintf(stderr, "packet too short; not sending to pcap.\n");
                 continue;
             }
 
-            result = pcap_sendpacket(fds[i]->adhandle, buffer, length);
+            result = pcap_sendpacket(fds[i]->adhandle, outBuffer, outLength);
 
             if (result == 0) {
-                result = length;
+                result = outLength;
             }
         }
         #endif
@@ -1389,7 +1315,7 @@ static void do_output(int fd_ind, byte *buffer, int length, char got_udp_msg,
         else if (fds[i]->udp_target) {
             sock_addr_len = sizeof(fds[0]->udp_sockaddr);
 
-            result = sendto(fds[i]->fd, buffer, length, MSG_NOSIGNAL,
+            result = sendto(fds[i]->fd, outBuffer, outLength, MSG_NOSIGNAL,
                     (struct sockaddr *) &fds[i]->udp_sockaddr,
                     sock_addr_len);
 
@@ -1406,7 +1332,7 @@ static void do_output(int fd_ind, byte *buffer, int length, char got_udp_msg,
         /* tcp connection? */
         else { /* not fds[i]->udp_target */
             int lcl_errno;
-            result = send(fds[i]->fd, buffer, length,
+            result = send(fds[i]->fd, outBuffer, outLength,
                     MSG_NOSIGNAL | (dontwait ? MSG_DONTWAIT : 0));
             lcl_errno = errno;
 
@@ -1419,14 +1345,14 @@ static void do_output(int fd_ind, byte *buffer, int length, char got_udp_msg,
                 packet_recvd(fds[i], result >= 0);
 
             if (result < 1) {
-                fds[fd_ind]->error_count++;
+                fds[read_fd_ind]->error_count++;
 
                 if (verbose > 0)
                     fprintf(stderr, "2 problem with sendto:  %s; errno %d\n",
                             strerror(lcl_errno), lcl_errno);
 
                 if (lcl_errno != EAGAIN)
-                    reopen_tcp_connection(i, "do_output 2");
+                    reset_tcp_connection(i, "do_output 2");
             }
         }
     }
@@ -1439,14 +1365,22 @@ static void do_output(int fd_ind, byte *buffer, int length, char got_udp_msg,
          * mode, don't send it to him.
          */
         if (got_udp_msg
-            && memcmp(&src_fd->msg_sockaddr, &udp_client_sockaddr[i].sockaddr,
-                    sizeof(src_fd->msg_sockaddr)) == 0
+            && memcmp(&read_fd_desc->msg_sockaddr, &udp_client_sockaddr[i].sockaddr,
+                    sizeof(read_fd_desc->msg_sockaddr)) == 0
             && !echo)
         {
             continue;
         }
 
-        result = sendto(udp_client_sockaddr[i].fd, buffer, length, MSG_NOSIGNAL,
+        fd_t *server_desc = udp_client_sockaddr[i].udp_server_fd_desc;
+
+        getOutputMessage(&outBuffer, &outLength, buffer, length, 
+                         server_desc->time_and_source,
+                         server_desc->text_msgs,
+                         server_desc->hex_msgs,
+                         read_fd);
+
+        result = sendto(server_desc->fd, outBuffer, outLength, MSG_NOSIGNAL,
                 (struct sockaddr *) &udp_client_sockaddr[i].sockaddr,
                 sock_addr_len);
 
@@ -1468,9 +1402,7 @@ static void do_output(int fd_ind, byte *buffer, int length, char got_udp_msg,
 }
 
 /*****************************************************************************
- * Function name:  void fork_udp_pinger(int fd)
- * Description:
- *    fork a process that sends an empty message once per second to
+ * Fork a process that sends an empty message once per second to
  *    a udp server.  the udp server might start after this udp client,
  *    and the server has to hear at least one message from this client 
  *    to become aware of it.
@@ -1529,9 +1461,7 @@ static void fork_udp_pinger(int fd) {
 }
 
 /*****************************************************************************
- * Function name:  int fd_iterate(int *iter_ind)
- * Description:
- *    iterator for fd indices.  the fd array has a priority field,
+ * Iterator for fd indices.  the fd array has a priority field,
  *    currently just 1 or larger than 1.  we want to iterate over
  *    the file descriptors with available incoming data in priority order.
  *    iter_ind goes from 0 to 2 * fd_count - 1; first half is high priority
@@ -1562,9 +1492,12 @@ static int fd_iterate(int *iter_ind) {
     }
 }
 
-/* process result of read attempt.  result != 0 iff read was successful.
- * decide whether to close the connection from which the packet was read.
- */
+/*****************************************************************************
+ * Process result of read attempt.
+ *     Decide whether to close the connection from which the packet was read.
+ * Returns
+ *     0 iff read was successful.
+ *****************************************************************************/
 static void packet_recvd(fd_t *fd, int result) {
     struct timeval tm;
     long long now;
@@ -1606,6 +1539,15 @@ static void packet_recvd(fd_t *fd, int result) {
     }
 }
 
+void selectPrint(char const * const title, int maxFd, fd_set *fds) {
+    int i;
+    printf("%s:  ", title);
+    for (i = 0; i <= maxFd; ++i) {
+        if (FD_ISSET(i, fds)) printf("%d ", i);
+    }
+    printf("\n");
+}
+
 int accept_tcp_client(int fd_ind) {
     int fd;
 
@@ -1631,14 +1573,12 @@ int accept_tcp_client(int fd_ind) {
         close(fd);
 
     } else {
-        add_fd(fd, false, false, false, false,
-                connect_tcp_inbound_client);
+        add_fd(fd, false, false, false, false, connect_tcp_inbound_client);
 
-        fds[fd_count-1]->exclude_out = fds[fd_ind]->exclude_out;
-        fds[fd_count-1]->hex_msgs = fds[fd_ind]->hex_msgs;
+        fds[fd_count-1]->no_input  = fds[fd_ind]->no_input;
+        fds[fd_count-1]->no_output = fds[fd_ind]->no_output;
     }
 
-    #ifdef LINUX
     /* if we are supposed to fork a separate server process for
      * each tcp client, do that now.
      */
@@ -1660,33 +1600,66 @@ int accept_tcp_client(int fd_ind) {
             return 0;
         }
     }
-    #endif
 
     return 0;
 }
 
+void add_tcp_proxy_client(int tcp_server_accept_fd_ind) {
+    fd_t *accept_fd = fds[tcp_server_accept_fd_ind];
+    int fd;
+    printf("add_tcp_proxy_client..\n");
+
+    if (accept_tcp_client(tcp_server_accept_fd_ind) >= 0) {
+        printf("add_tcp_proxy_client ok..\n");
+        fds[fd_count-1]->connect_type = connect_tcp_proxy_inbound_client;
+
+        fd = open_client_socket(accept_fd->host, accept_fd->port);
+
+        add_fd(fd, false, true, false, false, connect_tcp_client);
+        fds[fd_count-1]->connect_type = connect_tcp_proxy_client;
+
+        fds[fd_count-1]->proxy_partner = fds[fd_count-2];
+        fds[fd_count-2]->proxy_partner = fds[fd_count-1];
+
+        fds[fd_count-1]->host = accept_fd->host;
+        fds[fd_count-1]->port = accept_fd->port;
+    }
+    printf("done add_tcp_proxy_client..\n");
+}
+
+int addSelectFd(int fd, fd_set *fds, int max_fd) {
+    if (fd > max_fd) {
+        max_fd = fd;
+    }
+    if (fd >= 0) {
+        FD_SET(fd, fds);
+    }
+
+    return max_fd;
+}
+
 void usage() {
     printf("-p/-P:  tcp client/server.\n");
-    printf("\n");
     printf("-u/-U:  udp client/server; client does pings to notify server.\n");
+    printf("-k:     stdin/stdout.\n");
+    printf("-s:     filename.  works for /dev/ttyS0 etc., named pipes, regular files.\n");
+    printf("-X:     tcp proxy; local_server:remote_host:remote_port\n");
+    #ifdef LINUX_RAW
+    printf("-w:     raw network device interface eth0 etc.  (requires sudo.)\n");
+    #endif
     printf("\n");
-    printf("-k:     text-based stdin/stdout.\n");
-    printf("-r:     raw stdin/stdout\n");
-    printf("-b:     hex-based stdout.\n");
+    printf("-i      next interface is input only\n");
+    printf("-o      next interface is output only\n");
     printf("\n");
-    printf("-t:     next interface (which must use stdout) has time/direction\n");
-    printf("-i/o    next interface is only input (resp. output)\n");
-    printf("\n");
-    printf("-s      use file system file.  works for /dev/ttyS0 etc., named pipes, regular files.\n");
-    printf("\n");
-    printf("-w      raw network device interface eth0 etc.  (requires sudo.)\n");
+    printf("-d:     next interface is prefaced with time/direction\n");
+    printf("-b:     next interface prints data formatted as hex dump\n");
+    printf("-t:     next interface shows non-printable characters in hex\n");
+
     exit(0);
 }
 
 /*****************************************************************************
- * Function name:  int main(int argc, char ** argv)
- * Description:
- *    main routine
+ * Main routine
  * Args:
  *    int argc:  number of input arguments
  *    char **argv:  vector of input arguments
@@ -1703,15 +1676,10 @@ int main(int argc, char **argv) {
     int unconnected_tcp_client;
     int c;
     int i, j, fd_ind, result;
-    byte buffer[BUFSIZE];
     byte got_something;
     char *host;
     int port;
     int lcl_errno;
-
-    #ifdef WINDOWS
-        initwin();
-    #endif
 
     start_time = time__usec();
 
@@ -1722,8 +1690,7 @@ int main(int argc, char **argv) {
     }
 
     /* process command-line arguments */
-    while ((c = getopt(argc, argv, "abdDefFhikl:mNop:rP:s:tu:U:vw:xX:")) != EOF) {
-        if (c == '?') continue;
+    while ((c = getopt(argc, argv, "abdDefFhikNop:P:s:tu:U:vw:X:")) != EOF) {
 
         switch (c) {
             case 'h':
@@ -1752,32 +1719,45 @@ int main(int argc, char **argv) {
                 }
                 break;
 
-            case 'k':
+            case 'k': {
+                int lcl_hex_msgs = hex_msgs;
+                int lcl_text_msgs = text_msgs;
+                int lcl_time_and_source = time_and_source;
+
                 #ifdef WINDOWS
                     fprintf(stderr, "'k' option invalid on Windows; "
                             "build and use cserver.exe instead\n");
                     exit(1);
                 #endif
-                text_msgs = 1;
-                add_fd(0, false, true, false, false, connect_keyboard);
+
+                if (!no_input) {
+                    add_fd(0, false, true, false, false, connect_keyboard);
+                    fds[fd_count-1]->no_output = 1;
+                }
+                no_input = 0;
+
+                if (!no_output) {
+                    hex_msgs        = lcl_hex_msgs;
+                    text_msgs       = lcl_text_msgs;
+                    time_and_source = lcl_time_and_source;
+
+                    add_fd(1, false, true, false, false, connect_keyboard);
+                    fds[fd_count-1]->no_input = 1;
+                }
+                no_output = 0;
+
                 break;
+            }
 
             case 'b':
-                no_input = true;
-                if (no_output) {
-                    fprintf(stderr,
-                            "'b' and 'i' option cannot be used together.\n");
-                    exit(1);
-                }
                 hex_msgs = 1;
-                add_fd(0, false, true, false, false, connect_keyboard);
-                break;
-
-            case 'r':
-                add_fd(0, false, true, false, false, connect_keyboard);
                 break;
 
             case 't':
+                text_msgs = 1;
+                break;
+
+            case 'd':
                 time_and_source = 1;
                 break;
 
@@ -1811,52 +1791,16 @@ int main(int argc, char **argv) {
                 dontwait = 0;
                 break;
 
-            case 'X': {
-                fd_t *fp = fds[fd_count-1];
-                if (fd_count == 0) {
-                    fprintf(stderr, "-X must come after an interface\n");
-                    return 1;
-                }
-                if (fp->exclude_port_count >= MAX_EXCLUDE
-                    || sscanf(optarg, "%d",
-                        &fp->exclude_ports[fp->exclude_port_count++]) != 1)
-                {
-                    fprintf(stderr, "-X error\n");
-                    return 1;
-                }
-                break;
-            }
-
             case 's':
                 add_fd(-1, false, true, false, false, connect_file);
                 setup_file_interface(optarg, fds[fd_count - 1]);
                 break;
-
-            case 'm':
-                if (fd_count <= 0) {
-                    fprintf(stderr, "-m option must come after an interface\n");
-                    return -1;
-                }
-                marked = fds[fd_count-1];
-                break;
-
-            case 'x': {
-                if (fd_count <= 0 || marked == NULL) {
-                    fprintf(stderr, "-x option must come after a marked "
-                            "interface\n");
-                    return -1;
-                }
-                fds[fd_count-1]->exclude_out = marked;
-                break;
-            }
 
             case 'N':
                 timeout_bad_client = true;
                 break;
 
             case 'u':
-                check_valid(fd_count < MAX_FD, "too many connections");
-
                 add_fd(-1, true, true, false, false, connect_udp_client);
 
                 setup_udp_client_interface(strdup(optarg), fds[fd_count - 1]);
@@ -1897,21 +1841,27 @@ int main(int argc, char **argv) {
                 do_udp_pinger = 0;
                 break;
 
-            case 'l':
-                result = sscanf(optarg, "%d", &port);
-                if (result != 1) {
-                    fprintf(stderr, "`%s' is not a valid port\n", optarg);
-                    exit(1);
-                }
-                fd = open_udp_server_socket(port);
-                fprintf(stderr, "open udp server socket %d returned %d\n",
-                        port, fd);
-                if (fd < 0) {
+            case 'X': {
+                char *arg = strdup(optarg);
+                char *remoteHost;
+                int proxyServerPort;
+                int remoteHostServerPort;
+                get_host_ports(&remoteHost, &remoteHostServerPort, &proxyServerPort, arg);
+                int accept_socket = open_server_socket(proxyServerPort);
+
+                fprintf(stderr, "open proxy server socket %d returned %d\n",
+                        proxyServerPort, accept_socket);
+
+                if (accept_socket == -1) {
                     exit(1);
                 }
 
-                add_fd(fd, true, false, false, false, connect_udp_listener);
+                add_fd(accept_socket, false, false, false, false, connect_tcp_proxy_server);
+                fds[fd_count-1]->host = remoteHost;
+                fds[fd_count-1]->port = remoteHostServerPort;
+
                 break;
+            }
 
             case 'U':
             case 'P': {
@@ -1951,8 +1901,7 @@ int main(int argc, char **argv) {
             }
 
             default:
-                fprintf(stderr, "hmmmm.  don't understand option '%c'\n", c);
-                break;
+                exit(1);
         }
     } /* while process command-line arguments */
 
@@ -2021,8 +1970,14 @@ int main(int argc, char **argv) {
                 continue;
             }
 
-            if (fds[i]->connect_type == connect_tcp_client && fds[i]->fd == -1) {
-                reopen_tcp_connection(i, "pre-select");
+            if (fds[i]->fd == -1
+                && (fds[i]->connect_type == connect_tcp_client
+                    || fds[i]->connect_type == connect_tcp_proxy_client))
+            {
+                // we would like to try this now, because if we have unconnected
+                // tcp clients we want to do a select with timeout instead of a
+                // "forever" select.
+                reset_tcp_connection(i, "pre-select");
 
                 if (fds[i]->fd == -1) {
                     unconnected_tcp_client = 1;
@@ -2030,15 +1985,7 @@ int main(int argc, char **argv) {
                 }
             }
 
-            if (fds[i]->fd > max_fd) {
-                max_fd = fds[i]->fd;
-            }
-
-            FD_SET(fds[i]->fd, &io_set);
-        }
-
-        if (max_fd == -1) {
-            continue;
+            max_fd = addSelectFd(fds[i]->fd, &io_set, max_fd);
         }
 
         {
@@ -2047,6 +1994,9 @@ int main(int argc, char **argv) {
                 result = select(max_fd + 1, &io_set, NULL, NULL, &tv);
             #else
                 if (unconnected_tcp_client) {
+                    // in this case we don't want to block forever until
+                    // there's some input; we repetitively try to re-connect
+                    // to a tcp server.
                     tv.tv_usec = 100000;
                     result = select(max_fd + 1, &io_set, NULL, NULL, &tv);
 
@@ -2054,11 +2004,9 @@ int main(int argc, char **argv) {
                     result = select(max_fd + 1, &io_set, NULL, NULL, NULL);
                 }
             #endif
-            server_bp1();
         }
 
         if (result <= 0) {
-            // fprintf(stderr, "didn't get anything..\n");
             goto end_loop;
         }
 
@@ -2109,9 +2057,6 @@ int main(int argc, char **argv) {
                 if (timeout_bad_client)
                     packet_recvd(fds[fd_ind], length >= 0);
 
-                // fprintf(stderr, "source port of received message:  %d\n",
-                        // ntohs(fds[fd_ind]->msg_sockaddr.sin_port));
-
                 do_output(fd_ind, buffer, length, got_udp_msg, 0);
 
                 /* if this is a udp client communicating to us, add them to
@@ -2139,7 +2084,7 @@ int main(int argc, char **argv) {
                             udp_client_count--;
                         }
 
-                        udp_client_sockaddr[udp_client_count].fd = fds[fd_ind]->fd;
+                        udp_client_sockaddr[udp_client_count].udp_server_fd_desc = fds[fd_ind];
                         udp_client_sockaddr[udp_client_count++].sockaddr
                             = fds[fd_ind]->msg_sockaddr;
                     }
@@ -2190,6 +2135,10 @@ int main(int argc, char **argv) {
                 accept_tcp_client(fd_ind);
                 goto end_loop;
 
+            } else if (fds[fd_ind]->connect_type == connect_tcp_proxy_server) {
+                add_tcp_proxy_client(fd_ind);
+                goto end_loop;
+
             } else {
                 got_udp_msg = 0;
 
@@ -2216,11 +2165,7 @@ int main(int argc, char **argv) {
 
         /* sleep .01 second if we didn't receive anything from any interface */
         if (!got_something) {
-            #if defined(LINUX)
-                usleep(10000);
-            #elif defined(WINDOWS)
-                Sleep(10);
-            #endif
+            usleep(10000);
         }
 
     } /* while accepting incoming connections and messages from clients.. */

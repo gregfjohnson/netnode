@@ -5,6 +5,6 @@
 #ifndef HEXDUMP_H
 #define HEXDUMP_H
 
-void hexdump(unsigned char *message, int length);
+int hexdump(char *outBuf, int outBufLen, unsigned char *message, int length);
 
 #endif // HEXDUMP_H
