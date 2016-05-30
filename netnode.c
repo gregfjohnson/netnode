@@ -1149,7 +1149,8 @@ void getOutputMessage(byte **outBuffer, int *outLen, byte *buffer, int length,
         outBuf += len;
 
     } else {
-        for (int i = 0; i < length; ++i) {
+        int i;
+        for (i = 0; i < length; ++i) {
             if (bufLen <= 1) break;
             *outBuf++ = *buffer++;
             --bufLen;
