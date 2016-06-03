@@ -78,6 +78,7 @@ typedef enum {
 
     connect_udp_server,
     connect_udp_client,
+    connect_udp_inbound_client,
 
     connect_tcp_server,             // the -P port to which clients connect
     connect_tcp_client,             // we are a "-p" tcp client
@@ -128,7 +129,8 @@ typedef struct _fd_t {
     #endif
 
     /* the host and port of udp server for whom we are a client based on
-     * '-u host:port' command-line arguments
+     * '-u host:port' command-line arguments.
+     * or, if this is a connect_udp_inbound_client, their return address.
      */
     struct sockaddr_in udp_sockaddr;
 
@@ -138,7 +140,7 @@ typedef struct _fd_t {
     /* for incoming udp messages, the sockaddr containing the source
      * port and IP address
      */
-    struct sockaddr_in msg_sockaddr;
+    // struct sockaddr_in msg_sockaddr;
 
     #ifdef LINUX_RAW
         struct sockaddr_ll raw_send_recv;
@@ -167,6 +169,13 @@ typedef struct _fd_t {
     /* print hex dump output for this interface? */
     int hex_msgs;
 } fd_t;
+
+static void add_fd(int            fd,
+                   char           udp_target,
+                   char           ima_client,
+                   char           pcap_client,
+                   char           raw_client,
+                   connect_type_t connect_type);
 
 void verify(int shouldBeTrue, const char *msg) {
     if (!shouldBeTrue) {
@@ -205,21 +214,10 @@ static int do_open_server_socket(int port, int connection_type) {
 
     /* attempt to open a socket */
 
-    sock = socket(
-        #ifdef WINDOWS
-            AF_INET,
-        #else
-            PF_INET,
-        #endif
-        connection_type, 0);
+    sock = socket(PF_INET, connection_type, 0);
 
     if (sock == -1) {
-        #ifdef WINDOWS
-            int error = WSAGetLastError();
-            fprintf(stderr, "socket failed:  %d\n", error);
-        #else
-            fprintf(stderr, "socket failed:  %s\n", strerror(errno));
-        #endif
+        fprintf(stderr, "socket failed:  %s\n", strerror(errno));
         return -1;
     }
 
@@ -239,12 +237,7 @@ static int do_open_server_socket(int port, int connection_type) {
     sin.sin_port   = htons(port);
 
     if (bind(sock, (struct sockaddr *)&sin, sizeof(sin)) == -1) {
-        #ifdef WINDOWS
-            int error = WSAGetLastError();
-            fprintf(stderr, "bind failed:  %d\n", error);
-        #else
-            fprintf(stderr, "bind failed:  %s\n", strerror(errno));
-        #endif
+        fprintf(stderr, "bind failed:  %s\n", strerror(errno));
         return -1;
     }
 
@@ -753,11 +746,90 @@ static int fds_closed = 0;
 #define MAX_UDP_CLIENT 256
 typedef struct {
     struct sockaddr_in sockaddr;
-    fd_t *udp_server_fd_desc;
+    fd_t *udp_inbound_client_fd_desc;
 } sockaddr_with_fd_t;
 
 sockaddr_with_fd_t udp_client_sockaddr[MAX_UDP_CLIENT];
 static int udp_client_count = 0;
+
+fd_t *findUdpInboundClient(struct sockaddr_in *inbound_msg_sockaddr) {
+    int i;
+    fd_t *result = NULL;
+    bool found = false;
+
+    for (i = 0; i < udp_client_count; i++) {
+        if (memcmp(inbound_msg_sockaddr,
+            &udp_client_sockaddr[i].sockaddr,
+            sizeof(struct sockaddr_in)) == 0)
+        {
+            found = true;
+            break;
+        }
+    }
+
+    if (found) {
+        result = udp_client_sockaddr[i].udp_inbound_client_fd_desc;
+    }
+
+    return result;
+}
+
+void ensureRoomForNewInboundUdpClient() {
+    if (udp_client_count >= MAX_UDP_CLIENT) {
+        int i;
+        for (i = 0; i < MAX_UDP_CLIENT - 1; i++) {
+            udp_client_sockaddr[i] = udp_client_sockaddr[i + 1];
+        }
+        udp_client_count--;
+    }
+}
+
+void addUdpInboundClient(struct sockaddr_in *inbound_msg_sockaddr, fd_t *my_udp_server_fd) {
+    ensureRoomForNewInboundUdpClient();
+
+    add_fd(my_udp_server_fd->fd, true, true, false, false, connect_udp_inbound_client);
+    fds[fd_count-1]->udp_sockaddr = *inbound_msg_sockaddr;
+
+    fds[fd_count-1]->no_input  = my_udp_server_fd->no_input;
+    fds[fd_count-1]->no_output = my_udp_server_fd->no_output;
+    fds[fd_count-1]->text_msgs = my_udp_server_fd->text_msgs;
+    fds[fd_count-1]->hex_msgs = my_udp_server_fd->hex_msgs;
+    fds[fd_count-1]->time_and_source = my_udp_server_fd->time_and_source;
+
+    udp_client_sockaddr[udp_client_count].udp_inbound_client_fd_desc = fds[fd_count-1];
+    udp_client_sockaddr[udp_client_count].sockaddr = *inbound_msg_sockaddr;
+
+    ++udp_client_count;
+}
+
+void removeUdpInboundClient(struct sockaddr_in *inbound_msg_sockaddr) {
+    int i, j;
+    fd_t *fd = NULL;
+    bool found = false;
+
+    for (i = 0; i < udp_client_count; i++) {
+        if (memcmp(&inbound_msg_sockaddr,
+            &udp_client_sockaddr[i].sockaddr,
+            sizeof(struct sockaddr_in)) == 0)
+        {
+            found = true;
+            break;
+        }
+    }
+
+    if (found) {
+        fd = udp_client_sockaddr[i].udp_inbound_client_fd_desc;
+        if (fd->fd_active) {
+            fds_closed = true;
+            fd->fd_active = false;
+        }
+
+        for (j = i; j < udp_client_count - 1; ++j) {
+            udp_client_sockaddr[j] = udp_client_sockaddr[j + 1];
+        }
+        udp_client_count--;
+    }
+}
 
 static void packet_recvd(fd_t *fd, int result);
 
@@ -1179,22 +1251,8 @@ static void do_output(int read_fd_ind, byte *buffer, int length, char got_udp_ms
     int          i;
     unsigned int sock_addr_len;
     int          read_fd        = fds[read_fd_ind]->fd;
-    fd_t*        read_fd_desc   = fds[read_fd_ind];
     byte*        outBuffer;
     int          outLength;
-
-    if (debug[0]) {
-        char outBuf[256];
-        fprintf(stderr, "do_output; read fd %d got result %d", read_fd, length);
-        if (got_udp_msg) {
-            fprintf(stderr, " from udp client %08x:%d",
-                    (unsigned int) fds[read_fd_ind]->msg_sockaddr.sin_addr.s_addr,
-                    ntohs(fds[read_fd_ind]->msg_sockaddr.sin_port));
-        }
-        fprintf(stderr, "\n");
-        hexdump(outBuf, 256, buffer, length);
-        fprintf(stderr, "%s\n", outBuf);
-    }
 
     /* if read failed or gave EOF.. */
     if (length <= 0) {
@@ -1289,7 +1347,7 @@ static void do_output(int read_fd_ind, byte *buffer, int length, char got_udp_ms
             }
         }
 
-        if (fds[i]->write != NULL) {
+        else if (fds[i]->write != NULL) {
             result = fds[i]->write(fds[i], outBuffer, outLength);
         }
 
@@ -1312,7 +1370,7 @@ static void do_output(int read_fd_ind, byte *buffer, int length, char got_udp_ms
         }
         #endif
 
-        /* command-line udp connection ("-u" or "-U")? */
+        /* udp connection ("-u", "-U", or inbound client to "U")? */
         else if (fds[i]->udp_target) {
             sock_addr_len = sizeof(fds[0]->udp_sockaddr);
 
@@ -1358,6 +1416,7 @@ static void do_output(int read_fd_ind, byte *buffer, int length, char got_udp_ms
         }
     }
 
+    #if 0
     /* send received message to udp clients */
     for (i = 0; i < udp_client_count; i++) {
         sock_addr_len = sizeof(udp_client_sockaddr[i].sockaddr);
@@ -1400,6 +1459,7 @@ static void do_output(int read_fd_ind, byte *buffer, int length, char got_udp_ms
                     result);
         }
     }
+    #endif
 }
 
 /*****************************************************************************
@@ -1578,6 +1638,9 @@ int accept_tcp_client(int fd_ind) {
 
         fds[fd_count-1]->no_input  = fds[fd_ind]->no_input;
         fds[fd_count-1]->no_output = fds[fd_ind]->no_output;
+        fds[fd_count-1]->text_msgs = fds[fd_ind]->text_msgs;
+        fds[fd_count-1]->hex_msgs = fds[fd_ind]->hex_msgs;
+        fds[fd_count-1]->time_and_source = fds[fd_ind]->time_and_source;
     }
 
     /* if we are supposed to fork a separate server process for
@@ -1668,15 +1731,12 @@ void usage() {
  *    0 if no errors, 1 otherwise
  *****************************************************************************/
 int main(int argc, char **argv) {
-    #ifdef WINDOWS
-        int error;
-    #endif
     int fd, max_fd;
     int my_server_port = -1;
     socklen_t sock_addr_len;
     int unconnected_tcp_client;
     int c;
-    int i, j, fd_ind, result;
+    int i, fd_ind, result;
     byte got_something;
     char *host;
     int port;
@@ -1724,12 +1784,6 @@ int main(int argc, char **argv) {
                 int lcl_hex_msgs = hex_msgs;
                 int lcl_text_msgs = text_msgs;
                 int lcl_time_and_source = time_and_source;
-
-                #ifdef WINDOWS
-                    fprintf(stderr, "'k' option invalid on Windows; "
-                            "build and use cserver.exe instead\n");
-                    exit(1);
-                #endif
 
                 if (!no_input) {
                     add_fd(0, false, true, false, false, connect_keyboard);
@@ -1803,7 +1857,6 @@ int main(int argc, char **argv) {
 
             case 'u':
                 add_fd(-1, true, true, false, false, connect_udp_client);
-
                 setup_udp_client_interface(strdup(optarg), fds[fd_count - 1]);
 
                 break;
@@ -2006,6 +2059,13 @@ int main(int argc, char **argv) {
                 }
             #endif
         }
+        #ifdef DEBUG1
+            selectPrint("past select", max_fd, &io_set);
+            printf("fd_count:  %d\n", fd_count);
+            for (int i = 0; i < fd_count; ++i) printf("<ctp %d, fd %d> ",
+                    fds[i]->connect_type, fds[i]->fd);
+            printf("\n");
+        #endif
 
         if (result <= 0) {
             goto end_loop;
@@ -2036,86 +2096,62 @@ int main(int argc, char **argv) {
             if (read_fd < 0 || !FD_ISSET(read_fd, &io_set)) {
                 continue;
             }
+            printf("past FD_ISSET with %d..\n", read_fd);
 
             if (fds[fd_ind]->read != NULL) {
+                printf("read method..\n");
                 length = fds[fd_ind]->read(fds[fd_ind], buffer, BUFSIZE-1);
+                printf("past it..\n");
 
                 if (timeout_bad_client)
                     packet_recvd(fds[fd_ind], length >= 0);
 
                 do_output(fd_ind, buffer, length, false, 0);
 
-            } else if (fds[fd_ind]->udp_target) {
-                char found;
+            } else if (fds[fd_ind]->connect_type == connect_udp_server) {
+                struct sockaddr_in inbound_msg_sockaddr;
 
                 got_udp_msg = 1;
 
-                sock_addr_len = sizeof(fds[fd_ind]->msg_sockaddr);
+                sock_addr_len = sizeof(inbound_msg_sockaddr);
                 length = recvfrom(read_fd, buffer, BUFSIZE-1, 0,
-                        (struct sockaddr *) &fds[fd_ind]->msg_sockaddr,
+                        (struct sockaddr *) &inbound_msg_sockaddr,
                         &sock_addr_len);
+
+                // may have multiple inbound clients; they would
+                // all have this same server/udp-receiver fd.
+                // only want to try to read it once.
+                FD_CLR(read_fd, &io_set);
 
                 if (timeout_bad_client)
                     packet_recvd(fds[fd_ind], length >= 0);
 
                 do_output(fd_ind, buffer, length, got_udp_msg, 0);
 
-                /* if this is a udp client communicating to us, add them to
+                /* if this is an inbound udp client communicating to us, add them to
                  * our list of clients and include them in our broadcasts
                  * of future messages.
                  */
                 if (fds[fd_ind]->connect_type == connect_udp_server && length >= 0) {
-                    found = 0;
-                    for (i = 0; i < udp_client_count; i++) {
-                        if (memcmp(&fds[fd_ind]->msg_sockaddr,
-                            &udp_client_sockaddr[i].sockaddr,
-                            sizeof(fds[fd_ind]->msg_sockaddr)) == 0)
-                        {
-                            found = 1;
-                            break;
-                        }
-                    }
+                    fd_t *found = findUdpInboundClient(&inbound_msg_sockaddr);
 
-                    if (!found) {
-                        if (udp_client_count >= MAX_UDP_CLIENT) {
-                            for (i = 0; i < MAX_UDP_CLIENT - 1; i++) {
-                                udp_client_sockaddr[i]
-                                    = udp_client_sockaddr[i + 1];
-                            }
-                            udp_client_count--;
-                        }
-
-                        udp_client_sockaddr[udp_client_count].udp_server_fd_desc = fds[fd_ind];
-                        udp_client_sockaddr[udp_client_count++].sockaddr
-                            = fds[fd_ind]->msg_sockaddr;
+                    if (found == NULL) {
+                        addUdpInboundClient(&inbound_msg_sockaddr, fds[fd_ind]);
+                        goto end_loop;
                     }
                 }
 
-                if (fds[fd_ind]->connect_type == connect_udp_server && length < 0) {
-                    found = 0;
-                    for (i = 0; i < udp_client_count; i++) {
-                        if (memcmp(&fds[fd_ind]->msg_sockaddr,
-                            &udp_client_sockaddr[i].sockaddr,
-                            sizeof(fds[fd_ind]->msg_sockaddr)) == 0)
-                        {
-                            found = 1;
-                            break;
-                        }
-                    }
+                // did an inbound client message give us a bad return value?
+                // if so, garbage-collect the inbound client record.
 
-                    if (found) {
-                        for (j = i; j < udp_client_count - 1; j++) {
-                            udp_client_sockaddr[j]
-                                = udp_client_sockaddr[j + 1];
-                        }
-                        udp_client_count--;
-                    }
+                if (fds[fd_ind]->connect_type == connect_udp_server && length < 0) {
+                    removeUdpInboundClient(&inbound_msg_sockaddr);
+                    goto end_loop;
                 }
 
                 continue;
             }
 
-            #ifndef WINDOWS
             else if (read_fd == 0) { /* keyboard input? */
                 got_udp_msg = 0;
 
@@ -2130,7 +2166,6 @@ int main(int argc, char **argv) {
 
                 do_output(fd_ind, buffer, length, got_udp_msg, 0);
             }
-            #endif
 
             else if (fds[fd_ind]->connect_type == connect_tcp_server) {
                 accept_tcp_client(fd_ind);
@@ -2151,12 +2186,9 @@ int main(int argc, char **argv) {
                         fprintf(stderr, "recv failed:  %s\n", strerror(errno));
                 }
 
-                if (timeout_bad_client)
+                if (timeout_bad_client) {
                     packet_recvd(fds[fd_ind], length >= 0);
-
-                #ifdef WINDOWS
-                    error = WSAGetLastError();
-                #endif
+                }
 
                 do_output(fd_ind, buffer, length, got_udp_msg, lcl_errno);
             }
