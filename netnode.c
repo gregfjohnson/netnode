@@ -1148,7 +1148,7 @@ static void close_proxy_tcp_connection(fd_t *fd_desc) {
 static int print_time_and_source(char *outBuf, int outBufLen, int sourceFd) {
     int resultLen;
     double now = time__usec();
-    resultLen = snprintf(outBuf, outBufLen, "%12.6lf >> %d >> ", now - start_time, sourceFd);
+    resultLen = snprintf(outBuf, outBufLen, "%12.6lf >> %d >>\n", now - start_time, sourceFd);
     if (resultLen > outBufLen - 1) {
         resultLen = outBufLen - 1;
     }
@@ -2096,12 +2096,9 @@ int main(int argc, char **argv) {
             if (read_fd < 0 || !FD_ISSET(read_fd, &io_set)) {
                 continue;
             }
-            printf("past FD_ISSET with %d..\n", read_fd);
 
             if (fds[fd_ind]->read != NULL) {
-                printf("read method..\n");
                 length = fds[fd_ind]->read(fds[fd_ind], buffer, BUFSIZE-1);
-                printf("past it..\n");
 
                 if (timeout_bad_client)
                     packet_recvd(fds[fd_ind], length >= 0);

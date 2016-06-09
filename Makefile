@@ -3,7 +3,7 @@ all: netnode
 test: hexdump_test
 
 netnode: netnode.c netnode.h hexdump.o
-	gcc -g -Wall -DMAIN -o netnode netnode.c hexdump.o
+	gcc -g -Wall -DMAIN -DLINUX_RAW -o netnode netnode.c hexdump.o
 
 hexdump.o: hexdump.c hexdump.h
 	gcc -g -Wall -c hexdump.c
