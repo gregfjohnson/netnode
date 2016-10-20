@@ -53,6 +53,10 @@
 
 #include "netnode.h"
 
+#define RELEASE_VERSION  1
+#define MAJOR_VERSION    0
+#define MINOR_VERSION    1
+
 #ifdef PCAP_LIB
     #define HAVE_REMOTE
     #include "pcap.h"
@@ -1703,21 +1707,22 @@ int addSelectFd(int fd, fd_set *fds, int max_fd) {
 }
 
 void usage() {
-    printf("-p/-P:  tcp client/server.\n");
-    printf("-u/-U:  udp client/server; client does pings to notify server.\n");
-    printf("-k:     stdin/stdout.\n");
-    printf("-s:     filename.  works for /dev/ttyS0 etc., named pipes, regular files.\n");
-    printf("-X:     tcp proxy; local_server:remote_host:remote_port\n");
+    printf("netnode v. %d.%d.%d\n", RELEASE_VERSION, MAJOR_VERSION, MINOR_VERSION);
+    printf("    -p/-P:  tcp client/server.\n");
+    printf("    -u/-U:  udp client/server; client does pings to notify server.\n");
+    printf("    -k:     stdin/stdout.\n");
+    printf("    -s:     filename.  works for /dev/ttyS0 etc., named pipes, regular files.\n");
+    printf("    -X:     tcp proxy; local_server:remote_host:remote_port\n");
     #ifdef LINUX_RAW
-    printf("-w:     raw network device interface eth0 etc.  (requires sudo.)\n");
+    printf("    -w:     raw network device interface eth0 etc.  (requires sudo.)\n");
     #endif
     printf("\n");
-    printf("-i      next interface is input only\n");
-    printf("-o      next interface is output only\n");
+    printf("    -i      next interface is input only\n");
+    printf("    -o      next interface is output only\n");
     printf("\n");
-    printf("-d:     next interface is prefaced with time/direction\n");
-    printf("-b:     next interface prints data formatted as hex dump\n");
-    printf("-t:     next interface shows non-printable characters in hex\n");
+    printf("    -d:     next interface is prefaced with time/direction\n");
+    printf("    -b:     next interface prints data formatted as hex dump\n");
+    printf("    -t:     next interface shows non-printable characters in hex\n");
 
     exit(0);
 }
