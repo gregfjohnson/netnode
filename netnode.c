@@ -1149,12 +1149,18 @@ static void close_proxy_tcp_connection(fd_t *fd_desc) {
     }
 }
 
+static int prev_sourceFd = -1;
+
 static int print_time_and_source(char *outBuf, int outBufLen, int sourceFd) {
-    int resultLen;
-    double now = time__usec();
-    resultLen = snprintf(outBuf, outBufLen, "%12.6lf >> %d >>\n", now - start_time, sourceFd);
-    if (resultLen > outBufLen - 1) {
-        resultLen = outBufLen - 1;
+    int resultLen = 0;
+
+    if (sourceFd != prev_sourceFd) {
+        double now = time__usec();
+        resultLen = snprintf(outBuf, outBufLen, "\n%12.6lf >> %d >>\n", now - start_time, sourceFd);
+        if (resultLen > outBufLen - 1) {
+            resultLen = outBufLen - 1;
+        }
+        prev_sourceFd = sourceFd;
     }
     return resultLen;
 }
