@@ -55,7 +55,7 @@
 
 #define RELEASE_VERSION  1
 #define MAJOR_VERSION    0
-#define MINOR_VERSION    2
+#define MINOR_VERSION    3
 
 #ifdef PCAP_LIB
     #define HAVE_REMOTE
@@ -2027,7 +2027,9 @@ int main(int argc, char **argv) {
                 continue;
             }
 
-            if (fds[i]->no_input) {
+            if (fds[i]->no_input
+                && fds[i]->connect_type != connect_udp_server
+                && fds[i]->connect_type != connect_tcp_server) {
                 continue;
             }
 
@@ -2134,7 +2136,9 @@ int main(int argc, char **argv) {
                 if (timeout_bad_client)
                     packet_recvd(fds[fd_ind], length >= 0);
 
-                do_output(fd_ind, buffer, length, got_udp_msg, 0);
+                if (!fds[fd_ind]->no_input) {
+                    do_output(fd_ind, buffer, length, got_udp_msg, 0);
+                }
 
                 /* if this is an inbound udp client communicating to us, add them to
                  * our list of clients and include them in our broadcasts
