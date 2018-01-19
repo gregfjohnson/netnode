@@ -30,6 +30,7 @@
 
 #include <sys/uio.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/select.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -55,7 +56,7 @@
 
 #define RELEASE_VERSION  1
 #define MAJOR_VERSION    0
-#define MINOR_VERSION    3
+#define MINOR_VERSION    4
 
 #ifdef PCAP_LIB
     #define HAVE_REMOTE
@@ -65,6 +66,8 @@
 
 #define BUFSIZE 65536
 #define MAX_EXCLUDE 16
+
+#define UNIX_PATH_MAX    108
 
 typedef unsigned char byte;
 
@@ -87,6 +90,8 @@ typedef enum {
     connect_tcp_server,             // the -P port to which clients connect
     connect_tcp_client,             // we are a "-p" tcp client
     connect_tcp_inbound_client,     // client connection to our "-P"
+
+    connect_unix_client,
 
     connect_tcp_proxy_server,       // my tcp server port for proxy clients
     connect_tcp_proxy_client,
@@ -172,6 +177,10 @@ typedef struct _fd_t {
 
     /* print hex dump output for this interface? */
     int hex_msgs;
+
+    /* is this interface in an interface group? */
+    int in_group;
+    int group;
 } fd_t;
 
 static void add_fd(int            fd,
@@ -203,6 +212,65 @@ server_fd_ptr_t server_fd_new() {
     fd_t *result = (fd_t *) malloc(sizeof(fd_t));
 
     return (server_fd_ptr_t) result;
+}
+
+/*****************************************************************************
+ * Open a unix server socket
+ * Args:
+ *    char *fileName:  name of the unix socket in the file system
+ * Returns:
+ *    a file descriptor that can be used for accept calls
+ *****************************************************************************/
+static int do_open_unix_server_socket(char *fileName) {
+    int sock;
+    struct sockaddr_un sun;
+    int backlogQueueLength = 5;
+
+    sock = socket(PF_UNIX, SOCK_STREAM, 0);
+
+    if (sock == -1) {
+        fprintf(stderr, "socket failed:  %s\n", strerror(errno));
+        return -1;
+    }
+
+    sun.sun_family = AF_UNIX;
+    strncpy(sun.sun_path, fileName, UNIX_PATH_MAX);
+
+    if (bind(sock, (struct sockaddr *)&sun, sizeof(sun)) == -1) {
+        fprintf(stderr, "bind failed:  %s (file already exists or cannot be created?)\n",
+                strerror(errno));
+        return -1;
+    }
+
+    if (listen(sock, backlogQueueLength) == -1) {
+        fprintf(stderr, "listen failed:  %s\n", strerror(errno));
+        return -1;
+    }
+
+    return sock;
+
+} /* do_open_server_socket() */
+
+static int do_open_unix_client_socket(char *socketName) {
+    struct sockaddr_un  sun;
+    int                 sock;
+    int res;
+ 
+    sock = socket(PF_UNIX, SOCK_STREAM, 0);
+    if (sock == -1) {
+        fprintf(stderr, "socket() failed\n");
+        return -1;
+    }
+
+    sun.sun_family = AF_UNIX;
+    strncpy(sun.sun_path, socketName, UNIX_PATH_MAX);
+
+    if ((res=connect(sock, (struct sockaddr *) &sun, sizeof (sun))) == -1) {
+        close(sock);
+        return -1;
+    }
+
+    return sock;
 }
 
 /*****************************************************************************
@@ -692,6 +760,9 @@ static int verbose = 0;
 static char text_msgs = false;
 static char hex_msgs = false;
 
+static char in_group = false;
+static int group = -1;
+
 static char no_output = false;
 static char no_input = false;
 
@@ -799,6 +870,8 @@ void addUdpInboundClient(struct sockaddr_in *inbound_msg_sockaddr, fd_t *my_udp_
     fds[fd_count-1]->text_msgs = my_udp_server_fd->text_msgs;
     fds[fd_count-1]->hex_msgs = my_udp_server_fd->hex_msgs;
     fds[fd_count-1]->time_and_source = my_udp_server_fd->time_and_source;
+    fds[fd_count-1]->in_group = my_udp_server_fd->in_group;
+    fds[fd_count-1]->group = my_udp_server_fd->group;
 
     udp_client_sockaddr[udp_client_count].udp_inbound_client_fd_desc = fds[fd_count-1];
     udp_client_sockaddr[udp_client_count].sockaddr = *inbound_msg_sockaddr;
@@ -888,6 +961,10 @@ static void add_fd(int            fd,
 
         fds[fd_count]->text_msgs = text_msgs;
         text_msgs = false;
+
+        fds[fd_count]->in_group = in_group;
+        in_group = false;
+        fds[fd_count]->group = group;
 
     fds[fd_count]->udp_target = udp_target;
     fds[fd_count]->ima_client = ima_client;
@@ -1073,6 +1150,7 @@ static void close_tcp_connection(struct _fd_t *fd_desc, char *title) {
 
     if (   fd_desc->connect_type != connect_tcp_server
         && fd_desc->connect_type != connect_tcp_client
+        && fd_desc->connect_type != connect_unix_client
         && fd_desc->connect_type != connect_tcp_inbound_client
         && fd_desc->connect_type != connect_tcp_proxy_server
         && fd_desc->connect_type != connect_tcp_proxy_client
@@ -1108,6 +1186,7 @@ static void reset_tcp_connection(int fd_ind, char *title) {
     fd_t *fd_struct = fds[fd_ind];
 
     if (   fd_struct->connect_type != connect_tcp_client
+        && fd_struct->connect_type != connect_unix_client
         && fd_struct->connect_type != connect_tcp_proxy_client)
     {
         if (verbose > 0)
@@ -1119,7 +1198,12 @@ static void reset_tcp_connection(int fd_ind, char *title) {
 
     close(fd_struct->fd);
 
-    int fd = open_client_socket(fd_struct->host, fd_struct->port);
+    int fd;
+    if (fd_struct->connect_type == connect_unix_client) {
+        fd = do_open_unix_client_socket(fd_struct->host);
+    } else {
+        fd = open_client_socket(fd_struct->host, fd_struct->port);
+    }
 
     if (fd < 0) {
         fd_struct->fd = -1;
@@ -1316,6 +1400,13 @@ static void do_output(int read_fd_ind, byte *buffer, int length, char got_udp_ms
 
         /* are we supposed to echo the message back to the client? */
         if (fds[i]->fd == read_fd && !echo) {
+            continue;
+        }
+
+        if (fds[i]->in_group
+            && fds[read_fd_ind]->in_group
+            && fds[i]->group != fds[read_fd_ind]->group)
+        {
             continue;
         }
 
@@ -1650,6 +1741,8 @@ int accept_tcp_client(int fd_ind) {
         fds[fd_count-1]->no_output = fds[fd_ind]->no_output;
         fds[fd_count-1]->text_msgs = fds[fd_ind]->text_msgs;
         fds[fd_count-1]->hex_msgs = fds[fd_ind]->hex_msgs;
+        fds[fd_count-1]->in_group = fds[fd_ind]->in_group;
+        fds[fd_count-1]->group    = fds[fd_ind]->group;
         fds[fd_count-1]->time_and_source = fds[fd_ind]->time_and_source;
     }
 
@@ -1714,21 +1807,38 @@ int addSelectFd(int fd, fd_set *fds, int max_fd) {
 
 void usage() {
     printf("netnode v. %d.%d.%d\n", RELEASE_VERSION, MAJOR_VERSION, MINOR_VERSION);
-    printf("    -p/-P:  tcp client/server.\n");
-    printf("    -u/-U:  udp client/server; client does pings to notify server.\n");
-    printf("    -k:     stdin/stdout.\n");
-    printf("    -s:     filename.  works for /dev/ttyS0 etc., named pipes, regular files.\n");
-    printf("    -X:     tcp proxy; local_server:remote_host:remote_port\n");
+    printf("    -k             - stdin/stdout.\n");
+    printf("\n");
+    printf("    -P port        - tcp server.\n");
+    printf("    -p [host:]port - tcp client; stays alive if server is unavailable.\n");
+    printf("\n");
+    printf("    -U port        - udp server.\n");
+    printf("    -u [host:]port - udp client; client does pings to notify server.\n");
+    printf("\n");
+    printf("    -Z filename    - unix socket server.\n");
+    printf("    -z filename    - unix socket client; stays alive if server is unavailable.\n");
+    printf("\n");
+    printf("    -s filename    -  works for /dev/ttyS0 etc., named pipes, regular files.\n");
+    printf("\n");
+    printf("    -X [[source_port:]host:]dest_port - tcp proxy.\n");
     #ifdef LINUX_RAW
-    printf("    -w:     raw network device interface eth0 etc.  (requires sudo.)\n");
+    printf("    -w ethN        - raw network device interface eth0 etc.  (requires sudo.)\n");
     #endif
     printf("\n");
-    printf("    -i      next interface is input only\n");
-    printf("    -o      next interface is output only\n");
+    printf("    -i             - next interface is input only.\n");
+    printf("    -o             - next interface is output only.\n");
     printf("\n");
-    printf("    -d:     next interface is prefaced with time/direction\n");
-    printf("    -b:     next interface prints data formatted as hex dump\n");
-    printf("    -t:     next interface shows non-printable characters in hex\n");
+    printf("    -g N           - group next interface to not interact with other groups.\n");
+    printf("        Example:\n");
+    printf("            machineA#  netnode -k -g 1 -p 2001 -g 1 -p 2002 -g 2 -p 3001 -g 2 -p 3002\n");
+    printf("\n");
+    printf("    -d:            - next interface is prefaced with time/direction.\n");
+    printf("    -b:            - next interface prints data formatted as hex dump.\n");
+    printf("    -t:            - next interface shows non-printable characters in hex.\n");
+    printf("\n");
+    printf("        Example:\n");
+    printf("            machineA#  netnode -k -p machineB:1234\n");
+    printf("            machineB#  netnode -k -P 1234\n");
 
     exit(0);
 }
@@ -1762,7 +1872,7 @@ int main(int argc, char **argv) {
     }
 
     /* process command-line arguments */
-    while ((c = getopt(argc, argv, "abdDefFhikNop:P:s:tu:U:vw:X:")) != EOF) {
+    while ((c = getopt(argc, argv, "abdDefFg:hikNop:P:s:tu:U:vw:X:z:Z:")) != EOF) {
 
         switch (c) {
             case 'h':
@@ -1795,6 +1905,8 @@ int main(int argc, char **argv) {
                 int lcl_hex_msgs = hex_msgs;
                 int lcl_text_msgs = text_msgs;
                 int lcl_time_and_source = time_and_source;
+                int lcl_in_group = in_group;
+                int lcl_group = group;
 
                 if (!no_input) {
                     add_fd(0, false, true, false, false, connect_keyboard);
@@ -1806,6 +1918,8 @@ int main(int argc, char **argv) {
                     hex_msgs        = lcl_hex_msgs;
                     text_msgs       = lcl_text_msgs;
                     time_and_source = lcl_time_and_source;
+                    in_group        = lcl_in_group;
+                    group           = lcl_group;
 
                     add_fd(1, false, true, false, false, connect_keyboard);
                     fds[fd_count-1]->no_input = 1;
@@ -1814,6 +1928,14 @@ int main(int argc, char **argv) {
 
                 break;
             }
+
+            case 'g':
+                check_valid(sscanf(optarg, "%d", &group) == 1,
+                        "`%s' is not a valid port\n", optarg);
+
+                in_group = 1;
+
+                break;
 
             case 'b':
                 hex_msgs = 1;
@@ -1872,6 +1994,14 @@ int main(int argc, char **argv) {
 
                 break;
 
+            case 'z': {
+                fd = do_open_unix_client_socket(optarg);
+                add_fd(fd, false, true, false, false, connect_unix_client);
+                fds[fd_count-1]->host = optarg;
+
+                break;
+            }
+
             case 'p': {
                 char *p;
                 if (strchr(optarg, (int) ':') != NULL) {
@@ -1924,6 +2054,21 @@ int main(int argc, char **argv) {
                 add_fd(accept_socket, false, false, false, false, connect_tcp_proxy_server);
                 fds[fd_count-1]->host = remoteHost;
                 fds[fd_count-1]->port = remoteHostServerPort;
+
+                break;
+            }
+
+            case 'Z': {
+                int accept_socket = do_open_unix_server_socket(optarg);
+                fprintf(stderr, "open server socket %s returned %d\n",
+                        optarg, accept_socket);
+
+                if (accept_socket == -1) {
+                    exit(1);
+                }
+
+                add_fd(accept_socket, false, false, false, false,
+                        connect_tcp_server);
 
                 break;
             }
@@ -2039,6 +2184,7 @@ int main(int argc, char **argv) {
 
             if (fds[i]->fd == -1
                 && (fds[i]->connect_type == connect_tcp_client
+                    || fds[i]->connect_type == connect_unix_client
                     || fds[i]->connect_type == connect_tcp_proxy_client))
             {
                 // we would like to try this now, because if we have unconnected
