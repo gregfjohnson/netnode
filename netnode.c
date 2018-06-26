@@ -56,7 +56,7 @@
 
 #define RELEASE_VERSION  1
 #define MAJOR_VERSION    0
-#define MINOR_VERSION    4
+#define MINOR_VERSION    5
 
 #ifdef PCAP_LIB
     #define HAVE_REMOTE
@@ -2076,9 +2076,10 @@ int main(int argc, char **argv) {
             case 'U':
             case 'P': {
                 char use_udp;
-                result = sscanf(optarg, "%d", &my_server_port);
-                if (result != 1) {
-                    fprintf(stderr, "`%s' is not a valid port\n", optarg);
+                int len;
+                result = sscanf(optarg, "%d%n", &my_server_port, &len);
+                if (result != 1 || len != strlen(optarg)) {
+                    fprintf(stderr, "`%s' is not a valid server port\n", optarg);
                     exit(1);
                 }
 
@@ -2086,8 +2087,12 @@ int main(int argc, char **argv) {
 
                 if (use_udp) {
                     fd = open_udp_server_socket(my_server_port);
-                    fprintf(stderr, "open udp server socket %d returned %d\n",
-                            my_server_port, fd);
+
+                    #ifdef DEBUG1
+                        fprintf(stderr, "open udp server socket %d returned %d\n",
+                                my_server_port, fd);
+                    #endif
+
                     if (fd < 0) {
                         exit(1);
                     }
@@ -2096,8 +2101,11 @@ int main(int argc, char **argv) {
 
                 } else {
                     int accept_socket = open_server_socket(my_server_port);
-                    fprintf(stderr, "open server socket %d returned %d\n",
-                            my_server_port, accept_socket);
+
+                    #ifdef DEBUG1
+                        fprintf(stderr, "open server socket %d returned %d\n",
+                                my_server_port, accept_socket);
+                    #endif
 
                     if (accept_socket == -1) {
                         exit(1);
