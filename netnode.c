@@ -2321,7 +2321,7 @@ int main(int argc, char **argv) {
             else if (read_fd == 0) { /* keyboard input? */
                 got_udp_msg = 0;
 
-                length = read(read_fd, buffer, BUFSIZE-1);
+                length = read(read_fd, buffer, BUFSIZE-2);
 
                 if (timeout_bad_client)
                     packet_recvd(fds[fd_ind], length >= 0);
@@ -2329,6 +2329,9 @@ int main(int argc, char **argv) {
                 #ifdef WINDOWS
                     error = WSAGetLastError();
                 #endif
+
+                ++length;
+                buffer[length-1] = 0;
 
                 do_output(fd_ind, buffer, length, got_udp_msg, 0);
             }
