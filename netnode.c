@@ -1841,6 +1841,7 @@ void usage() {
     printf("    -d:            - next interface is prefaced with time/direction.\n");
     printf("    -b:            - next interface prints data formatted as hex dump.\n");
     printf("    -t:            - next interface shows non-printable characters in hex.\n");
+    printf("    -H:            - save history from next interface and send it to new connections.\n");
     printf("\n");
     printf("        Example:\n");
     printf("            machineA#  netnode -k -p machineB:1234\n");
