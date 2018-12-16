@@ -158,8 +158,14 @@ typedef struct _fd_t {
 
     int priority;
 
+    /* for UDP and TCP clients ("-u", "-p"), the server host and port */
     int port;
     char *host;
+
+    /* for TCP and UDP servers ("-P", "-U"), this program's port on which
+     * to accept connections (TCP) or inbound messages (UDP).
+     */
+    int server_port;
 
     struct _fd_t *proxy_partner;
 
@@ -248,7 +254,6 @@ void cbufPush(Cbuf *buf, byte dataValue) {
 
 void save_history(byte *buffer, int buflen) {
     int i;
-    printf("save_history..\n");
     for (i = 0; i < buflen; ++i) {
         cbufPush(&history, buffer[i]);
     }
@@ -1704,7 +1709,6 @@ static void selectPrint(char const * const title, int maxFd, fd_set *fds) {
 
 void tcp_send_history(int fd_ind) {
     int i;
-    printf("tcp_send_history..\n");
     for (i = 0; i < history.length; ++i) {
         byte ch = cbufIndex(&history, i);
         send_to_tcp_target(-1, fd_ind, &ch, 1);
@@ -1719,8 +1723,10 @@ int accept_tcp_client(int fd_ind) {
      * incoming client connection.
      */
     fd = accept_server_socket(fds[fd_ind]->fd);
-    fprintf(stderr, "attempt to accept on %d got back %d\n",
-            fds[fd_ind]->fd, fd);
+    if (verbose > 0) {
+        fprintf(stderr, "attempt to accept on %d got back %d\n",
+                fds[fd_ind]->fd, fd);
+    }
 
     if (fd == -1) {
         fprintf(stderr, 
@@ -1728,8 +1734,10 @@ int accept_tcp_client(int fd_ind) {
         return -1;
 
     } else {
-        fprintf(stderr, "new connection from client established; "
-                "fd %d\n", fd);
+        fprintf(stderr, "new TCP connection from client established; "
+                "accept port %d; "
+                "fd %d\n",
+                fds[fd_ind]->server_port, fd);
     }
 
     if (fd_count >= MAX_FD) {
@@ -2102,6 +2110,7 @@ int main(int argc, char **argv) {
                     }
 
                     add_fd(fd, true, false, false, false, connect_udp_server);
+                    fds[fd_count-1]->server_port = my_server_port;
 
                 } else {
                     int accept_socket = open_server_socket(my_server_port);
@@ -2114,6 +2123,7 @@ int main(int argc, char **argv) {
 
                     add_fd(accept_socket, false, false, false, false,
                             connect_tcp_server);
+                    fds[fd_count-1]->server_port = my_server_port;
                 }
 
                 break;
