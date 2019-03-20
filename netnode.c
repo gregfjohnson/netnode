@@ -56,7 +56,7 @@
 
 #define RELEASE_VERSION  1
 #define MAJOR_VERSION    0
-#define MINOR_VERSION    7
+#define MINOR_VERSION    8
 
 #ifdef PCAP_LIB
     #define HAVE_REMOTE
@@ -861,7 +861,7 @@ static int fd_count = 0;
  * mark it inactive, bump the fds_closed variable below, and then
  * compact the array when it's safe to do so.
  */
-static int fds_closed = 0;
+static bool fds_closed = false;
 
 /* read host and udp port from incoming udp client messages sent to us
  * as a udp server.  we add these guys to our list of connected nodes
@@ -910,18 +910,56 @@ int fd_ptr_to_fd_index(fd_t *fd) {
     return result;
 }
 
-void ensureRoomForNewInboundUdpClient() {
-    if (udp_client_count >= MAX_UDP_CLIENT) {
-        int i;
-        for (i = 0; i < MAX_UDP_CLIENT - 1; i++) {
-            udp_client_sockaddr[i] = udp_client_sockaddr[i + 1];
+void removeUdpInboundClient(struct sockaddr_in *inbound_msg_sockaddr) {
+    int i, j;
+    fd_t *fd = NULL;
+    bool found = false;
+
+    for (i = 0; i < udp_client_count; i++) {
+        if (memcmp(&inbound_msg_sockaddr,
+            &udp_client_sockaddr[i].sockaddr,
+            sizeof(struct sockaddr_in)) == 0)
+        {
+            found = true;
+            break;
+        }
+    }
+
+    if (found) {
+        fd = udp_client_sockaddr[i].udp_inbound_client_fd_desc;
+
+        if (fd->fd_active) {
+            fds_closed = true;
+            fd->fd_active = false;
+        }
+
+        for (j = i; j < udp_client_count - 1; ++j) {
+            udp_client_sockaddr[j] = udp_client_sockaddr[j + 1];
         }
         udp_client_count--;
     }
 }
 
+void ensureRoomForNewInboundUdpClient() {
+    if (fd_count >= MAX_FD - 10) {
+        if (udp_client_count > 0) {
+            fd_t *fd = udp_client_sockaddr[0].udp_inbound_client_fd_desc;
+            fds_closed = true;
+            fd->fd_active = false;
+            int i;
+            for (i = 0; i < udp_client_count - 1; i++) {
+                udp_client_sockaddr[i] = udp_client_sockaddr[i + 1];
+            }
+            udp_client_count--;
+        }
+    }
+}
+
 void addUdpInboundClient(struct sockaddr_in *inbound_msg_sockaddr, fd_t *my_udp_server_fd) {
-    ensureRoomForNewInboundUdpClient();
+    if (udp_client_count >= MAX_UDP_CLIENT) {
+        fprintf(stderr, "too many udp clients\n");
+        exit(1);
+    }
 
     add_fd(my_udp_server_fd->fd, true, true, false, false, connect_udp_inbound_client);
     fds[fd_count-1]->udp_sockaddr = *inbound_msg_sockaddr;
@@ -939,37 +977,6 @@ void addUdpInboundClient(struct sockaddr_in *inbound_msg_sockaddr, fd_t *my_udp_
     udp_client_sockaddr[udp_client_count].sockaddr = *inbound_msg_sockaddr;
 
     ++udp_client_count;
-}
-
-void removeUdpInboundClient(struct sockaddr_in *inbound_msg_sockaddr) {
-    int i, j;
-    fd_t *fd = NULL;
-    bool found = false;
-
-    for (i = 0; i < udp_client_count; i++) {
-        if (memcmp(&inbound_msg_sockaddr,
-            &udp_client_sockaddr[i].sockaddr,
-            sizeof(struct sockaddr_in)) == 0)
-        {
-            found = true;
-            break;
-        }
-    }
-
-
-    if (found) {
-        fd = udp_client_sockaddr[i].udp_inbound_client_fd_desc;
-
-        if (fd->fd_active) {
-            fds_closed = true;
-            fd->fd_active = false;
-        }
-
-        for (j = i; j < udp_client_count - 1; ++j) {
-            udp_client_sockaddr[j] = udp_client_sockaddr[j + 1];
-        }
-        udp_client_count--;
-    }
 }
 
 static void packet_recvd(fd_t *fd, int result);
@@ -1073,25 +1080,23 @@ static void compact_fds() {
         did_something = 0;
 
         for (i = 0; i < fd_count; i++) {
-            if (fds[i]->fd_active) {
-                continue;
+            if (!fds[i]->fd_active) {
+                /* put the element we don't need at the end, and then
+                 * decrement count.
+                 */
+                fd_t *tmp = fds[i];
+                fds[i] = fds[fd_count - 1];
+                fds[fd_count - 1] = tmp;
+
+                fd_count--;
+                if (verbose > 0)
+                    fprintf(stderr, "compact_fds; fd_count decremented to %d.\n",
+                            fd_count);
+
+                did_something = 1;
+
+                break;
             }
-
-            /* put the element we don't need at the end, and then
-             * decrement count.
-             */
-            fd_t *tmp = fds[i];
-            fds[i] = fds[fd_count - 1];
-            fds[fd_count - 1] = tmp;
-
-            fd_count--;
-            if (verbose > 0)
-                fprintf(stderr, "compact_fds; fd_count decremented to %d.\n",
-                        fd_count);
-
-            did_something = 1;
-
-            break;
         }
     } while (did_something);
 
@@ -1626,14 +1631,15 @@ static void ping_udp_servers() {
  *****************************************************************************/
 static int fd_iterate(int *iter_ind) {
     while (1) {
-        if ((!use_priorities && *iter_ind >= fd_count)
-            || (use_priorities && *iter_ind >= fd_count * 2)
-            || *iter_ind >= fd_count * 2)
+        int next_ind = *iter_ind + 1;
+        if ((!use_priorities && next_ind >= fd_count)
+            || (use_priorities && next_ind-fd_count >= fd_count)
+            || next_ind-fd_count >= fd_count * 2)
         {
             return -1;
         }
 
-        *iter_ind += 1;
+        *iter_ind = next_ind;
 
         if (*iter_ind < fd_count && fds[*iter_ind]->priority > 1) {
             return *iter_ind;
@@ -2141,7 +2147,11 @@ int main(int argc, char **argv) {
     while (1) {
         fd_set io_set;
 
+        ensureRoomForNewInboundUdpClient();
+
         compact_fds();
+
+        // fprintf(stderr, "fd_count %d, udp_client_count %d..\n", fd_count, udp_client_count);
 
         got_something = false;
 
