@@ -925,7 +925,6 @@ void addUdpInboundClient(struct sockaddr_in *inbound_msg_sockaddr, fd_t *my_udp_
 
     add_fd(my_udp_server_fd->fd, true, true, false, false, connect_udp_inbound_client);
     fds[fd_count-1]->udp_sockaddr = *inbound_msg_sockaddr;
-    fprintf(stderr, "addUdpInboundClient fd_ind %d\n", fd_count-1);
 
     fds[fd_count-1]->no_input  = my_udp_server_fd->no_input;
     fds[fd_count-1]->no_output = my_udp_server_fd->no_output;
@@ -947,8 +946,6 @@ void removeUdpInboundClient(struct sockaddr_in *inbound_msg_sockaddr) {
     fd_t *fd = NULL;
     bool found = false;
 
-    fprintf(stderr, "removeUdpInboundClient..\n");
-
     for (i = 0; i < udp_client_count; i++) {
         if (memcmp(&inbound_msg_sockaddr,
             &udp_client_sockaddr[i].sockaddr,
@@ -962,7 +959,6 @@ void removeUdpInboundClient(struct sockaddr_in *inbound_msg_sockaddr) {
 
     if (found) {
         fd = udp_client_sockaddr[i].udp_inbound_client_fd_desc;
-        fprintf(stderr, "removeUdpInboundClient found fd_ind %d..\n", fd_ptr_to_fd_index(fd));
 
         if (fd->fd_active) {
             fds_closed = true;
