@@ -697,6 +697,8 @@ static int do_open_client_socket(char *host,
         // fprintf(stderr, "connect() failed:  %s\n", strerror(errno));
         close(sock);
         return -1;
+    } else {
+        fprintf(stderr, "server connect\n");
     }
 
     return sock;
@@ -1268,6 +1270,9 @@ static void reset_tcp_connection(int fd_ind, char *title) {
         return;
     }
 
+    if (fd_struct->fd != -1) {
+        fprintf(stderr, "server disconnect\n");
+    }
     close(fd_struct->fd);
 
     int fd;
