@@ -828,7 +828,7 @@ static int die_if_lose_server = 0;
 
 static int debug[] = {
     0,
-    0,
+    1,
     0,
 };
 
@@ -852,6 +852,14 @@ static fd_t fd_recs[MAX_FD];
  * and compact_fds() and should only be changed by those routines.
 */
 static int fd_count = 0;
+
+void print_fds()
+{
+    for (int i = 0; i < fd_count; ++i) {
+        printf("%2d:  is_active %d; fd %d; type %d\n", 
+                i, fds[i]->fd_active, fds[i]->fd, fds[i]->connect_type);
+    }
+}
 
 /* the number of elements in fds[] that have fd_active false.
  * this is a little tricky.  in multiple places in the code, we
@@ -1256,15 +1264,17 @@ static void close_tcp_connection(struct _fd_t *fd_desc, char *title) {
  * Returns:
  *    no return value.
  *****************************************************************************/
-static void reset_tcp_connection(int fd_ind, char *title) {
+static void reset_tcp_connection(int fd_ind, char *title)
+{
     fd_t *fd_struct = fds[fd_ind];
 
     if (   fd_struct->connect_type != connect_tcp_client
         && fd_struct->connect_type != connect_unix_client
         && fd_struct->connect_type != connect_tcp_proxy_client)
     {
-        if (verbose > 0)
+        if (verbose > 0) {
             fprintf(stderr, "not a connect_tcp_client; return..\n");
+        }
 
         close_tcp_connection(fds[fd_ind], title);
         return;
@@ -1408,29 +1418,90 @@ void getOutputMessage(byte **outBuffer, int *outLen, byte *buffer, int length,
 void send_to_tcp_target(int read_fd_ind, int write_fd_ind,
                         byte *outBuffer, int outLength)
 {
-    int lcl_errno;
-    int result;
-    result = send(fds[write_fd_ind]->fd, outBuffer, outLength,
-            MSG_NOSIGNAL | (dontwait ? MSG_DONTWAIT : 0));
-    lcl_errno = errno;
-
-    if (debug[1]) {
-        fprintf(stderr, "wrote to fd %d; got result %d\n",
-                fds[write_fd_ind]->fd, result);
+    if (verbose) {
+        fprintf(stderr, "entering send_to_tcp_target with read ind %d, "
+                                                          "write ind %d..\n",
+                        read_fd_ind, write_fd_ind);
     }
 
-    if (timeout_bad_client)
+    int lcl_errno;
+    int result;
+    int sent = 0;
+    while (sent < outLength) {
+        int fd = fds[write_fd_ind]->fd;
+        if (fd == -1) {
+            break;
+        }
+
+        // to check if the other side has closed the connection
+        fd_set io_read_set;
+        FD_ZERO(&io_read_set);
+        FD_SET(fd, &io_read_set);
+
+        fd_set io_write_set;
+        FD_ZERO(&io_write_set);
+        FD_SET(fd, &io_write_set);
+
+        result = select(fd + 1, &io_read_set, &io_write_set, NULL, NULL);
+        fprintf(stderr, "past select; result %d\n", result);
+
+        if (result < 0) {
+            lcl_errno = errno;
+            break;
+        }
+
+        if (FD_ISSET(fd, &io_read_set)) {
+            fprintf(stderr, "select read available..\n");
+            uint8_t c;
+            ssize_t read_test = recv(fd, &c, 1, MSG_PEEK);
+            fprintf(stderr, "test read result %ld..\n", read_test);
+            if (read_test == 0) {
+                reset_tcp_connection(write_fd_ind, "send_to_tcp_target");
+                break;
+            }
+        }
+
+        if (!FD_ISSET(fd, &io_write_set)) {
+            fprintf(stderr, "select no write available; continuing..\n");
+            continue;
+        }
+
+        result = send(fd, &outBuffer[sent], outLength - sent,
+                      MSG_NOSIGNAL | (dontwait ? MSG_DONTWAIT : 0));
+
+        if (result < 0) {
+            lcl_errno = errno;
+        }
+
+        if (debug[1]) {
+            fprintf(stderr, "tried to write %d bytes to fd %d; got result %d\n",
+                    outLength - sent, fds[write_fd_ind]->fd, result);
+        }
+
+        if (result < 1 && read_fd_ind >= 0) {
+            fds[read_fd_ind]->error_count++;
+
+            if (verbose > 0) {
+                fprintf(stderr, "2 problem with sendto:  %s; errno %d\n",
+                        strerror(lcl_errno), lcl_errno);
+            }
+
+            if (lcl_errno != EAGAIN) {
+                reset_tcp_connection(write_fd_ind, "send_to_tcp_target");
+                fprintf(stderr, "do the break..\n");
+                break;
+            }
+        }
+
+        sent += result;
+    }
+
+    if (timeout_bad_client) {
         packet_recvd(fds[write_fd_ind], result >= 0);
+    }
 
-    if (result < 1 && read_fd_ind >= 0) {
-        fds[read_fd_ind]->error_count++;
-
-        if (verbose > 0)
-            fprintf(stderr, "2 problem with sendto:  %s; errno %d\n",
-                    strerror(lcl_errno), lcl_errno);
-
-        if (lcl_errno != EAGAIN)
-            reset_tcp_connection(write_fd_ind, "send_to_tcp_target");
+    if (verbose) {
+        fprintf(stderr, "returning from send_to_tcp_target..\n");
     }
 }
 
@@ -1477,13 +1548,15 @@ static void do_output(int read_fd_ind, byte *buffer, int length, char got_udp_ms
         {
             fds[read_fd_ind]->error_count++;
 
-            if (verbose > 0)
+            if (verbose > 0) {
                 fprintf(stderr, "1 problem with sendto:  %s; errno %d; "
                         "return %d\n",
                         strerror(errno), errno, length);
+            }
 
-            if (die_if_lose_server)
+            if (die_if_lose_server) {
                 server_exit(0);
+            }
 
             if (errno_arg != EAGAIN)
                 reset_tcp_connection(read_fd_ind, "do_output 1");
@@ -2065,7 +2138,8 @@ int main(int argc, char **argv) {
                 char *remoteHost;
                 int proxyServerPort;
                 int remoteHostServerPort;
-                get_host_ports(&remoteHost, &remoteHostServerPort, &proxyServerPort, arg);
+                get_host_ports(&remoteHost, &remoteHostServerPort,
+                                            &proxyServerPort, arg);
                 int accept_socket = open_server_socket(proxyServerPort);
 
                 fprintf(stderr, "open proxy server socket %d returned %d\n",
@@ -2075,7 +2149,9 @@ int main(int argc, char **argv) {
                     exit(1);
                 }
 
-                add_fd(accept_socket, false, false, false, false, connect_tcp_proxy_server);
+                add_fd(accept_socket, false, false, false, false,
+                       connect_tcp_proxy_server);
+
                 fds[fd_count-1]->host = remoteHost;
                 fds[fd_count-1]->port = remoteHostServerPort;
 
@@ -2156,7 +2232,10 @@ int main(int argc, char **argv) {
 
         compact_fds();
 
-        // fprintf(stderr, "fd_count %d, udp_client_count %d..\n", fd_count, udp_client_count);
+        if (verbose) { print_fds(); }
+
+        // fprintf(stderr, "fd_count %d, udp_client_count %d..\n",
+        //         fd_count, udp_client_count);
 
         got_something = false;
 
@@ -2378,8 +2457,9 @@ int main(int argc, char **argv) {
                 lcl_errno = errno;
 
                 if (length < 0) {
-                    if (verbose > 0)
+                    if (verbose > 0) {
                         fprintf(stderr, "recv failed:  %s\n", strerror(errno));
+                    }
                 }
 
                 if (timeout_bad_client) {
