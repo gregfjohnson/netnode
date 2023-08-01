@@ -179,6 +179,9 @@ typedef struct _fd_t {
     /* print text output for this interface? */
     int text_msgs;
 
+    /* use crlf line endings for this interface? */
+    int crlf_line_endings;
+
     /* print time and source with interface? */
     int time_and_source;
 
@@ -809,6 +812,8 @@ void setup_udp_client_interface(char *host_port, server_fd_ptr_t voidp_fd_desc) 
 
 static int verbose = 0;
 
+static char crlf_line_endings = false;
+
 static char text_msgs = false;
 static char hex_msgs = false;
 
@@ -828,7 +833,7 @@ static int die_if_lose_server = 0;
 
 static int debug[] = {
     0,
-    1,
+    0,
     0,
 };
 
@@ -978,6 +983,7 @@ void addUdpInboundClient(struct sockaddr_in *inbound_msg_sockaddr, fd_t *my_udp_
     fds[fd_count-1]->no_output = my_udp_server_fd->no_output;
     fds[fd_count-1]->keep_history = my_udp_server_fd->keep_history;
     fds[fd_count-1]->text_msgs = my_udp_server_fd->text_msgs;
+    fds[fd_count-1]->crlf_line_endings = my_udp_server_fd->crlf_line_endings;
     fds[fd_count-1]->hex_msgs = my_udp_server_fd->hex_msgs;
     fds[fd_count-1]->time_and_source = my_udp_server_fd->time_and_source;
     fds[fd_count-1]->in_group = my_udp_server_fd->in_group;
@@ -1045,6 +1051,9 @@ static void add_fd(int            fd,
 
         fds[fd_count]->text_msgs = text_msgs;
         text_msgs = false;
+
+        fds[fd_count]->crlf_line_endings = crlf_line_endings;
+        crlf_line_endings = false;
 
         fds[fd_count]->in_group = in_group;
         in_group = false;
@@ -1370,12 +1379,13 @@ static int print_text_msg(byte *outBuf, int outBufLen, byte *buffer, int length)
 void getOutputMessage(byte **outBuffer, int *outLen, byte *buffer, int length, 
                       int time_and_source,
                       int text_msgs,
+                      int crlf_line_endings,
                       int hex_msgs,
                       int sourceFd)
 {
     int bufLen = BUFSIZE;
 
-    if (!time_and_source && !hex_msgs && !text_msgs) {
+    if (!time_and_source && !hex_msgs && !text_msgs && !crlf_line_endings) {
         *outBuffer = buffer;
         *outLen = length;
         return;
@@ -1404,10 +1414,17 @@ void getOutputMessage(byte **outBuffer, int *outLen, byte *buffer, int length,
     } else {
         int i;
         for (i = 0; i < length; ++i) {
-            if (bufLen <= 1) break;
-            *outBuf++ = *buffer++;
-            --bufLen;
+	    if (crlf_line_endings && *buffer == '\n') {
+		if (bufLen <= 1) break;
+		*outBuf++ = '\r';
+	        --bufLen;
+	    }
+
+	    if (bufLen <= 1) break;
+	    *outBuf++ = *buffer++;
+	    --bufLen;
         }
+
         if (bufLen > 0)
             *outBuf = '\0';
     }
@@ -1443,7 +1460,9 @@ void send_to_tcp_target(int read_fd_ind, int write_fd_ind,
         FD_SET(fd, &io_write_set);
 
         result = select(fd + 1, &io_read_set, &io_write_set, NULL, NULL);
-        fprintf(stderr, "past select; result %d\n", result);
+	if (verbose) {
+            fprintf(stderr, "past select; result %d\n", result);
+	}
 
         if (result < 0) {
             lcl_errno = errno;
@@ -1626,6 +1645,7 @@ static void do_output(int read_fd_ind, byte *buffer, int length, char got_udp_ms
         getOutputMessage(&outBuffer, &outLength, buffer, length, 
                          fds[i]->time_and_source,
                          fds[i]->text_msgs,
+                         fds[i]->crlf_line_endings,
                          fds[i]->hex_msgs,
                          read_fd);
 
@@ -1831,6 +1851,7 @@ int accept_tcp_client(int fd_ind) {
         fds[fd_count-1]->no_output = fds[fd_ind]->no_output;
         fds[fd_count-1]->keep_history = fds[fd_ind]->keep_history;
         fds[fd_count-1]->text_msgs = fds[fd_ind]->text_msgs;
+        fds[fd_count-1]->crlf_line_endings = fds[fd_ind]->crlf_line_endings;
         fds[fd_count-1]->hex_msgs = fds[fd_ind]->hex_msgs;
         fds[fd_count-1]->in_group = fds[fd_ind]->in_group;
         fds[fd_count-1]->group    = fds[fd_ind]->group;
@@ -1968,7 +1989,7 @@ int main(int argc, char **argv) {
     }
 
     /* process command-line arguments */
-    while ((c = getopt(argc, argv, "abdDefFg:hHikNop:P:s:tu:U:vw:X:z:Z:")) != EOF) {
+    while ((c = getopt(argc, argv, "abdDefFg:hHikNop:P:rs:tu:U:vw:X:z:Z:")) != EOF) {
 
         switch (c) {
             case 'h':
@@ -2004,6 +2025,7 @@ int main(int argc, char **argv) {
             case 'k': {
                 int lcl_hex_msgs = hex_msgs;
                 int lcl_text_msgs = text_msgs;
+                int lcl_crlf_line_endings = crlf_line_endings;
                 int lcl_time_and_source = time_and_source;
                 int lcl_in_group = in_group;
                 int lcl_group = group;
@@ -2015,11 +2037,12 @@ int main(int argc, char **argv) {
                 no_input = 0;
 
                 if (!no_output) {
-                    hex_msgs        = lcl_hex_msgs;
-                    text_msgs       = lcl_text_msgs;
-                    time_and_source = lcl_time_and_source;
-                    in_group        = lcl_in_group;
-                    group           = lcl_group;
+                    hex_msgs          = lcl_hex_msgs;
+                    text_msgs         = lcl_text_msgs;
+                    crlf_line_endings = lcl_crlf_line_endings;
+                    time_and_source   = lcl_time_and_source;
+                    in_group          = lcl_in_group;
+                    group             = lcl_group;
 
                     add_fd(1, false, true, false, false, connect_keyboard);
                     fds[fd_count-1]->no_input = 1;
@@ -2043,6 +2066,10 @@ int main(int argc, char **argv) {
 
             case 't':
                 text_msgs = 1;
+                break;
+
+            case 'r':
+                crlf_line_endings = 1;
                 break;
 
             case 'd':
