@@ -890,6 +890,7 @@ typedef struct {
 
 sockaddr_with_fd_t udp_client_sockaddr[MAX_UDP_CLIENT];
 static int udp_client_count = 0;
+static bool do_ping_udp_servers = true;
 
 fd_t *findUdpInboundClient(struct sockaddr_in *inbound_msg_sockaddr) {
     int i;
@@ -1414,19 +1415,26 @@ void getOutputMessage(byte **outBuffer, int *outLen, byte *buffer, int length,
     } else {
         int i;
         for (i = 0; i < length; ++i) {
-	    if (crlf_line_endings && *buffer == '\n') {
-		if (bufLen <= 1) break;
-		*outBuf++ = '\r';
-	        --bufLen;
-	    }
+            if (crlf_line_endings && *buffer == '\n') {
+                if (bufLen <= 2) { break; }
 
-	    if (bufLen <= 1) break;
-	    *outBuf++ = *buffer++;
-	    --bufLen;
+                *outBuf++ = '\r';
+                --bufLen;
+
+                *outBuf++ = *buffer++;
+                --bufLen;
+
+            } else {
+                if (bufLen <= 1) { break; }
+
+                *outBuf++ = *buffer++;
+                --bufLen;
+            }
         }
 
-        if (bufLen > 0)
+        if (bufLen > 0) {
             *outBuf = '\0';
+        }
     }
 
     *outLen = outBuf - *outBuffer;
@@ -1460,9 +1468,9 @@ void send_to_tcp_target(int read_fd_ind, int write_fd_ind,
         FD_SET(fd, &io_write_set);
 
         result = select(fd + 1, &io_read_set, &io_write_set, NULL, NULL);
-	if (verbose) {
+        if (verbose) {
             fprintf(stderr, "past select; result %d\n", result);
-	}
+        }
 
         if (result < 0) {
             lcl_errno = errno;
@@ -1990,7 +1998,7 @@ int main(int argc, char **argv) {
     }
 
     /* process command-line arguments */
-    while ((c = getopt(argc, argv, "abdDefFg:hHikNop:P:rs:tu:U:vw:X:z:Z:")) != EOF) {
+    while ((c = getopt(argc, argv, "abcdDefFg:hHikNop:P:rs:tu:U:vw:X:z:Z:")) != EOF) {
 
         switch (c) {
             case 'h':
@@ -2114,6 +2122,10 @@ int main(int argc, char **argv) {
 
             case 'N':
                 timeout_bad_client = true;
+                break;
+
+            case 'c':
+                do_ping_udp_servers = false;
                 break;
 
             case 'u':
@@ -2500,7 +2512,7 @@ int main(int argc, char **argv) {
 
         end_loop:;
 
-        if (udp_client) {
+        if (udp_client && do_ping_udp_servers) {
             ping_udp_servers();
         }
 
