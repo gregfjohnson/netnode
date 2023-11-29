@@ -1965,6 +1965,17 @@ void usage() {
     printf("            machineA#  netnode -k -p machineB:1234\n");
     printf("            machineB#  netnode -k -P 1234\n");
 
+    printf("\n");
+    printf("        Other options:\n");
+    printf("    -a             - exit if server is lost.\n");
+    printf("    -c             - disable udp client pings of udp server.\n");
+    printf("    -D             - don't block on send operations.\n");
+    printf("    -e             - echo messages back to sender.\n");
+    printf("    -f             - fork tcp clients to separate processes.\n");
+    printf("    -N             - timeout client after multiple comm failures.\n");
+    printf("    -v             - verbose output.\n");
+
+
     exit(0);
 }
 
@@ -1998,7 +2009,7 @@ int main(int argc, char **argv) {
     }
 
     /* process command-line arguments */
-    while ((c = getopt(argc, argv, "abcdDefFg:hHikNop:P:rs:tu:U:vw:X:z:Z:")) != EOF) {
+    while ((c = getopt(argc, argv, "abcdDefg:hHikNop:P:rs:tu:U:vw:X:z:Z:")) != EOF) {
 
         switch (c) {
             case 'h':
