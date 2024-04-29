@@ -22,6 +22,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <sys/types.h>
+#include <time.h>
 #include <sys/time.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -56,7 +57,7 @@
 
 #define RELEASE_VERSION  1
 #define MAJOR_VERSION    0
-#define MINOR_VERSION    8
+#define MINOR_VERSION    10
 
 #ifdef PCAP_LIB
     #define HAVE_REMOTE
@@ -824,7 +825,7 @@ static char no_output = false;
 static char no_input = false;
 static char keep_history = false;
 
-static char time_and_source = false;
+static char time_and_source = 0;
 
 static char echo = 0;
 static char do_fork = 0;
@@ -1045,7 +1046,7 @@ static void add_fd(int            fd,
 
     // options for stdout
         fds[fd_count]->time_and_source = time_and_source;
-        time_and_source = false;
+        time_and_source = 0;
 
         fds[fd_count]->hex_msgs = hex_msgs;
         hex_msgs = false;
@@ -1330,19 +1331,47 @@ static void close_proxy_tcp_connection(fd_t *fd_desc) {
     }
 }
 
-static int prev_sourceFd = -1;
+ssize_t format_timeval(struct timeval *tv, char *buf, size_t sz)
+{
+  ssize_t written = -1;
+  struct tm *gm = localtime(&tv->tv_sec);
+
+  if (gm)
+  {
+    written = (ssize_t)strftime(buf, sz, "%Y-%m-%d %H:%M:%S", gm);
+    if ((written > 0) && ((size_t)written < sz))
+    {
+      int w = snprintf(buf+written, sz-(size_t)written, ".%06d", (int) tv->tv_usec);
+      written = (w > 0) ? written + w : -1;
+    }
+  }
+  return written;
+}
+
+static int print_date_time_and_source(char *outBuf, int outBufLen, int sourceFd) {
+    int resultLen = 0;
+    char timebuf[256];
+    struct timeval tm;
+
+    gettimeofday(&tm, NULL);
+    format_timeval(&tm, timebuf, sizeof(timebuf));
+    resultLen = snprintf(outBuf, outBufLen, "\n%s >> %d >>\n", timebuf, sourceFd);
+    if (resultLen > outBufLen - 1) {
+        resultLen = outBufLen - 1;
+    }
+
+    return resultLen;
+}
 
 static int print_time_and_source(char *outBuf, int outBufLen, int sourceFd) {
     int resultLen = 0;
 
-    if (sourceFd != prev_sourceFd) {
-        double now = time__usec();
-        resultLen = snprintf(outBuf, outBufLen, "\n%12.6lf >> %d >>\n", now - start_time, sourceFd);
-        if (resultLen > outBufLen - 1) {
-            resultLen = outBufLen - 1;
-        }
-        prev_sourceFd = sourceFd;
+    double now = time__usec();
+    resultLen = snprintf(outBuf, outBufLen, "\n%12.6lf >> %d >>\n", now - start_time, sourceFd);
+    if (resultLen > outBufLen - 1) {
+        resultLen = outBufLen - 1;
     }
+
     return resultLen;
 }
 
@@ -1396,8 +1425,14 @@ void getOutputMessage(byte **outBuffer, int *outLen, byte *buffer, int length,
 
     byte *outBuf = *outBuffer;
 
-    if (time_and_source) {
+    if (time_and_source == 1) {
         int len = print_time_and_source((char *) outBuf, bufLen, sourceFd);
+        bufLen -= len;
+        outBuf += len;
+    }
+
+    else if (time_and_source == 2) {
+        int len = print_date_time_and_source((char *) outBuf, bufLen, sourceFd);
         bufLen -= len;
         outBuf += len;
     }
@@ -1955,7 +1990,8 @@ void usage() {
     printf("        Example:\n");
     printf("            machineA#  netnode -k -g 1 -p 2001 -g 1 -p 2002 -g 2 -p 3001 -g 2 -p 3002\n");
     printf("\n");
-    printf("    -d:            - next interface is prefaced with time/direction.\n");
+    printf("    -d:            - next interface is prefaced with time_from_start/direction.\n");
+    printf("    -D:            - next interface is prefaced with date_time/direction.\n");
     printf("    -b:            - next interface prints data formatted as hex dump.\n");
     printf("    -t:            - next interface shows non-printable characters in hex.\n");
     printf("    -r:            - next interface adds Carriage Return to linefeed characters.\n");
@@ -1969,7 +2005,7 @@ void usage() {
     printf("        Other options:\n");
     printf("    -a             - exit if server is lost.\n");
     printf("    -c             - disable udp client pings of udp server.\n");
-    printf("    -D             - don't block on send operations.\n");
+    printf("    -W             - don't block on send operations.\n");
     printf("    -e             - echo messages back to sender.\n");
     printf("    -f             - fork tcp clients to separate processes.\n");
     printf("    -N             - timeout client after multiple comm failures.\n");
@@ -2096,6 +2132,10 @@ int main(int argc, char **argv) {
                 time_and_source = 1;
                 break;
 
+            case 'D':
+                time_and_source = 2;
+                break;
+
             case 'e':
                 echo = 1;
                 break;
@@ -2122,7 +2162,7 @@ int main(int argc, char **argv) {
                 break;
             #endif
 
-            case 'D':
+            case 'W':
                 dontwait = 0;
                 break;
 
